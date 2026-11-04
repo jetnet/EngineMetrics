@@ -139,6 +139,17 @@ delta-samples between polls:
   engine this was built on); with several label sets the percentiles render `—`
   rather than a silently mixed series (the average and `n` still come from the
   flat last-wins sum/count).
+- **Cache reuse panel** = `/health` `kept_bytes` (memory held by kept prompts).
+  Its `kept_bytes_cap` is shown only when non-zero: a reported cap of `0` has no
+  documented meaning, so it is not claimed to mean "unlimited". `kept_mix` is
+  shown under its own key names (`own`/`shared`/`chats`/`rows`) because the
+  engine publishes no HELP text for it. `prefix_waits`/`prefix_wait_tokens` and
+  `chats_continued`/`chats_continued_prefill_tokens` are labelled from their
+  `/metrics` HELP text (requests that waited for a prefix another request was
+  prefilling, and the prompt tokens they did not prefill again; streams that
+  continued without resuming their own turn state, and the tokens they
+  prefilled). Absent keys print `n/a` and hide the panel when nothing is
+  reported.
 
 ## How the vLLM numbers are derived
 

@@ -102,7 +102,12 @@ if __name__ == "__main__":
                  "lat_buckets": {1.0: 100.0, 2.5: 300.0, 5.0: 450.0, 10.0: 560.0,
                                  30.0: 580.0, 60.0: 588.0, float("inf"): 588.0},
                  "ttft_buckets": {0.5: 50.0, 1.0: 200.0, 2.5: 470.0, 5.0: 560.0,
-                                  10.0: 585.0, float("inf"): 588.0}}
+                                  10.0: 585.0, float("inf"): 588.0},
+                 "reuse": {"kept_bytes": 2997771520.0, "kept_bytes_cap": 0.0,
+                           "prefix_waits": 3.0, "prefix_wait_tokens": 40960.0,
+                           "chats_continued": 2.0, "chats_continued_prefill_tokens": 8192.0,
+                           "mix": {"own": 17.0, "shared": 15.0, "chats": 17.0,
+                                   "rows": 1162688.0}}}
             s.update(over)
             return s
 
@@ -157,7 +162,11 @@ if __name__ == "__main__":
                "tensorfold:requests_running 0", "tensorfold:requests_waiting 0",
                "tensorfold:prompt_tokens_total 1000",
                "tensorfold:generation_tokens_total 500"])
-        HEALTH = {"ok": True, "backend": "tensorfold", "busy": False}
+        HEALTH = {"ok": True, "backend": "tensorfold", "busy": False,
+                  "kept_bytes": 3033006080, "kept_bytes_cap": 0,
+                  "kept_mix": {"own": 17, "shared": 15, "chats": 17, "rows": 1162688},
+                  "prefix_waits": 2, "prefix_wait_tokens": 40960,
+                  "chats_continued": 1, "chats_continued_prefill_tokens": 8192}
         # fetch_metrics_labeled() and fetch_json() both read through http_get()
         _common.http_get = lambda url, timeout=5: (
             METRICS if url.endswith("/metrics") else _json.dumps(HEALTH))
@@ -205,6 +214,23 @@ if __name__ == "__main__":
         assert sorted(cur["ttft_buckets"]) == [0.5, 1.0, 2.5, 5.0, 10.0, float("inf")]
         ttft_row = next(l for l in frame(cur) if "TTFT:" in l)
         assert "p99 ~9.42s" in ttft_row, ttft_row
+
+        # 5) cache-reuse parse from real /health keys; absent keys stay None
+        r = cur["reuse"]
+        assert r["kept_bytes"] == 3033006080.0 and r["kept_bytes_cap"] == 0.0, r
+        assert r["mix"] == {"own": 17.0, "shared": 15.0, "chats": 17.0,
+                           "rows": 1162688.0}, r
+        assert r["prefix_waits"] == 2.0 and r["chats_continued_prefill_tokens"] == 8192.0, r
+        mem_row = next(l for l in frame(cur) if "Kept memory:" in l)
+        # a reported cap of 0 must NOT be rendered (its meaning is undocumented)
+        assert "3.0G" in mem_row and "cap" not in mem_row, mem_row
+        mix_row = next(l for l in frame(cur) if "Kept mix:" in l)
+        assert "own 17" in mix_row and "rows 1.2M" in mix_row, mix_row
+        pw_row = next(l for l in frame(cur) if "Prefix waits:" in l)
+        assert "2 waits" in pw_row and "41.0K tok not re-prefilled" in pw_row, pw_row
+        # nothing reported -> the panel hides instead of printing four zero rows
+        ghost = dict(cur, reuse={k: None for k in r})
+        assert not any("Cache reuse" in l for l in frame(ghost)), "panel must hide"
 
         idle = dict(cur, **{"tensorfold:request_latency_seconds_count": 0.0,
                             "tensorfold:time_to_first_token_seconds_count": 0.0,

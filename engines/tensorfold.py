@@ -161,6 +161,18 @@ def sample(host, port):
     s["ttft_buckets"] = _buckets(series, "tensorfold:time_to_first_token_seconds")
     s["streams"] = health.get("streams", {}) or {}
     s["multi_prefill"] = health.get("multi_prefill", {}) or {}
+    # Cache-reuse picture from /health. Only prefix_waits*, chats_continued* and
+    # kept_prompts have authoritative /metrics HELP text; kept_mix and
+    # kept_bytes_cap are not documented there, so they are shown under their own
+    # key names and never interpreted (a cap of 0 is NOT claimed to mean
+    # "unlimited"). Absent keys stay None so the panel can print an honest gap.
+    reuse = {k: (_num(health[k]) if k in health else None)
+             for k in ("kept_bytes", "kept_bytes_cap", "prefix_waits", "prefix_wait_tokens",
+                       "chats_continued", "chats_continued_prefill_tokens")}
+    mix = health.get("kept_mix")
+    reuse["mix"] = ({k: _num(mix[k]) for k in ("own", "shared", "chats", "rows") if k in mix}
+                    if isinstance(mix, dict) else None)
+    s["reuse"] = reuse
     live = health.get("live")
     s["live"] = live if isinstance(live, dict) else {}
     s["max_batch_size"] = _num(health.get("max_batch_size"))
@@ -388,6 +400,47 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
             y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
+
+    # ---- Cache reuse (only when the engine reports it) ----
+    reuse = cur.get("reuse") or {}
+    if any(v is not None for k, v in reuse.items() if k != "mix") or reuse.get("mix"):
+        draw_box_start(stdscr, y, x, width, "Cache reuse (cumulative)")
+        y += 1
+        kb = reuse.get("kept_bytes")
+        cap = reuse.get("kept_bytes_cap")
+        if kb is None:
+            draw_row(stdscr, y, x, "Kept memory:", "n/a (not reported)", width, value_color=COLOR_DIM)
+        else:
+            val = format_bytes(kb) + (f"  cap {format_bytes(cap)}" if cap else "")
+            draw_row(stdscr, y, x, "Kept memory:", val, width)
+        y += 1
+        mix = reuse.get("mix")
+        if mix:
+            draw_row(stdscr, y, x, "Kept mix:",
+                     f"own {int(mix.get('own', 0))}  shared {int(mix.get('shared', 0))}  "
+                     f"chats {int(mix.get('chats', 0))}  rows {format_num(mix.get('rows', 0))}", width)
+        else:
+            draw_row(stdscr, y, x, "Kept mix:", "n/a (no kept_mix in /health)", width, value_color=COLOR_DIM)
+        y += 1
+        pw, pwt = reuse.get("prefix_waits"), reuse.get("prefix_wait_tokens")
+        if pw is None and pwt is None:
+            draw_row(stdscr, y, x, "Prefix waits:", "n/a (not reported)", width, value_color=COLOR_DIM)
+        else:
+            # HELP: requests that waited for a prefix another request was prefilling;
+            # the tokens are the prompt tokens they did not prefill again.
+            draw_row(stdscr, y, x, "Prefix waits:",
+                     f"{int(pw or 0)} waits  {format_num(pwt or 0)} tok not re-prefilled", width)
+        y += 1
+        cc, cct = reuse.get("chats_continued"), reuse.get("chats_continued_prefill_tokens")
+        if cc is None and cct is None:
+            draw_row(stdscr, y, x, "Chats continued:", "n/a (not reported)", width, value_color=COLOR_DIM)
+        else:
+            # HELP: streams continued without resuming from their own turn state
+            draw_row(stdscr, y, x, "Chats continued:",
+                     f"{int(cc or 0)} streams  {format_num(cct or 0)} tok prefilled", width)
+        y += 1
+        draw_box_end(stdscr, y, x, width)
+        y += 1
 
     # ---- Averages (cumulative histograms) ----
     lat_sum = cur["tensorfold:request_latency_seconds_sum"]
