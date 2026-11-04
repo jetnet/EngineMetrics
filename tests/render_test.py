@@ -279,7 +279,16 @@ if __name__ == "__main__":
         rows_z = frame(mlx_serve.sample("h", 1))
         tok_z = next(l for l in rows_z if "Token hit rate:" in l)
         assert "0.0%" in tok_z and "n/a" not in tok_z, tok_z
-        assert "n/a" not in next(l for l in rows_z if "cache-restored:" in l)
+        assert next(l for l in rows_z if "cache-restored:" in l).rstrip().endswith("/ 0")
+
+        # a zero denominator must render an em dash, not divide by zero
+        zero_den = metrics_text().replace("vllm:prompt_tokens_total 1234",
+                                          "vllm:prompt_tokens_total 0")
+        zero_den += "mlx_serve:prefix_cache_tokens_total 5\n"
+        body["metrics"] = lambda z=zero_den: z
+        rows_d = frame(mlx_serve.sample("h", 1))
+        tok_d = next(l for l in rows_d if "Token hit rate:" in l)
+        assert "—" in tok_d and "%" not in tok_d, tok_d
         body["metrics"] = metrics_text
 
         # ---- N1/N2: restart clears both windows and drops the stale prev ----

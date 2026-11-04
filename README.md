@@ -220,8 +220,8 @@ dashboard uses the natives where they're strictly better:
 - **Prefix cache** — token hit rate = `mlx_serve:prefix_cache_tokens_total` /
   `vllm:prompt_tokens_total`; query hit rate = `vllm:prefix_cache_hits_total` /
   `vllm:prefix_cache_queries_total`. An absent restored counter renders `n/a` for
-  the count; a zero denominator renders `—` for the rate while counts stay
-  numeric. Never a fake 0%.
+  the count and `—` for the token rate; a zero denominator renders `—` for the
+  rate while counts stay numeric. Never a fake 0%.
 - **Percentiles** = p50/p90/p99 interpolated from the cumulative `vllm:*` buckets
   (E2E, TTFT, prefill, decode, and the prompt/output token size distributions).
   `~` marks an estimate inside a coarse bucket, `>` a tail beyond the last finite
