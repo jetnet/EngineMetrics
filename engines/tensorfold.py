@@ -12,7 +12,7 @@ from .common import (
     draw_bar_row, draw_box_end,
     draw_box_start, draw_row, draw_two_col_row, fetch_json, fetch_metrics_labeled,
     format_bytes, format_latency, format_num, format_speed, format_uptime, get_value,
-    percentile_from_buckets, rate, sparkline_fit, wall_rate, wall_rate_safe,
+    quantile_strs, rate, sparkline_fit, wall_rate, wall_rate_safe,
 )
 
 TF_COUNTERS = [
@@ -95,27 +95,6 @@ def _buckets(series, base):
     return out
 
 
-def _quantile_strs(buckets, total, qs=(0.5, 0.9, 0.99)):
-    """p50/p90/p99 as display strings, or em dashes when the server exposes no
-    histogram or nothing has finished yet.
-
-    '>x' when the quantile falls past the last finite bucket: the tail is not
-    observable there, so claiming the bound as exact would be a lie. '~x'
-    otherwise, because the value is interpolated inside a coarse bucket rather
-    than measured.
-    """
-    finite = sorted((u, c) for u, c in (buckets or {}).items() if u != float("inf"))
-    out = []
-    for q in qs:
-        if total <= 0 or not finite:
-            out.append("—")
-            continue
-        if q * total > finite[-1][1]:
-            out.append(f">{format_latency(finite[-1][0])}")
-            continue
-        v = percentile_from_buckets(buckets, total, q)
-        out.append("—" if v is None else f"~{format_latency(v)}")
-    return out
 
 
 # /health "spill" dict (patch 0088 disk tier) — flattened as spill_<field> so
@@ -469,8 +448,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
 
     draw_box_start(stdscr, y, x, width, "Latency (cumulative)")
     y += 1
-    lat_q = _quantile_strs(cur.get("lat_buckets"), lat_n)
-    ttft_q = _quantile_strs(cur.get("ttft_buckets"), ttft_n)
+    lat_q = quantile_strs(cur.get("lat_buckets"), lat_n)
+    ttft_q = quantile_strs(cur.get("ttft_buckets"), ttft_n)
     draw_row(stdscr, y, x, "Latency:",
              f"avg {format_latency(avg_lat)}   p50 {lat_q[0]}  "
              f"p90 {lat_q[1]}  p99 {lat_q[2]}  (n={int(lat_n)})", width)

@@ -93,6 +93,8 @@ if __name__ == "__main__":
                             "context_length": 1000, "bytes_resident": 2 ** 30,
                             "meta": {"architecture": "arch", "quantization": "4-bit"}}]}
 
+        MUT = {}
+
         def metrics_text():
             out = []
             # e2e keeps 4 of 6 inside its last finite bucket: p50 interpolates,
@@ -118,16 +120,22 @@ if __name__ == "__main__":
                 "vllm:num_requests_waiting 0",
                 "vllm:prefix_cache_hits_total 0",
                 "vllm:prefix_cache_queries_total 0",
-                "mlx_serve:prefill_tokens_total 100",
+                "mlx_serve:prefill_tokens_total %s" % MUT.get("prefill", 100),
+                "mlx_serve:generation_tokens_live %s" % MUT.get("gen_live", 90),
                 "mlx_serve:request_failed_total 2",
                 "mlx_serve:request_rejected_total 1",
-                "mlx_serve:process_start_time_seconds %.1f" % START[0],
+                "mlx_serve:process_start_time_seconds %.1f" % MUT.get("start", START[0]),
                 "mlx_serve:ane_layers 12",
                 "mlx_serve:ane_int8_bytes 1073741824",
                 'mlx_serve:decode_serial_total{reason="grammar"} 3',
                 'mlx_serve:decode_serial_total{reason="stop"} 5',
             ]
-            return "\n".join(out) + "\n"
+            text = "\n".join(out) + "\n"
+            if MUT.get("drop_start"):
+                text = "\n".join(
+                    l for l in text.splitlines()
+                    if not l.startswith("mlx_serve:process_start_time_seconds")) + "\n"
+            return text
 
         body = {"metrics": metrics_text(), "props": _json.dumps(PROPS)}
         urls = []
@@ -197,24 +205,89 @@ if __name__ == "__main__":
         rows = frame(mlx_serve.sample("h", 1))
         assert any("Engine:" in l for l in rows), rows
 
-        # Restart detection lives in tick(): tolerance, and both windows reset.
-        body["metrics"] = metrics_text      # callable: each request re-reads START
+        # ---- N4: prefill and decode rows read their own histograms ----
+        body["props"] = _json.dumps(PROPS)      # junk props must not supply this row
+        rows = frame(mlx_serve.sample("h", 1))
+        pre = next(l for l in rows if l.startswith("│ Prefill:"))
+        dec = next(l for l in rows if l.startswith("│ Decode:"))
+        assert "(n=8)" in pre and "(n=9)" in dec, (pre, dec)
+        assert "adaptive True" in next(l for l in rows if "Speculation:" in l)
+
+        # ---- N4: junk /props types read n/a, they neither crash nor invent ----
+        body["props"] = _json.dumps({
+            "memory": {"peak_bytes": True, "weights_bytes": "8",
+                       "kv_cache_bytes": float("nan"), "available_bytes": 1024},
+            "settings": {"version": 5, "mtp": {"depth": True, "adaptive": "yes"}},
+        })
+        rows = frame(mlx_serve.sample("h", 1))
+        mem = next(l for l in rows if l.startswith("│ Memory:"))
+        assert mem.count("n/a") == 3, mem
+        assert "1.0K" in next(l for l in rows if "Available:" in l)
+        assert "adaptive n/a" in next(l for l in rows if "Speculation:" in l)
         body["props"] = _json.dumps(PROPS)
-        state = {"history": [], "prev": None, "start_time": time.time() - 30,
-                 "rate_hist": []}
+
+        # ---- N4: duplicate label sets drop the histogram, they never mix ----
+        body["metrics"] = metrics_text().replace(
+            'vllm:e2e_request_latency_seconds_bucket{le="1"} 0',
+            'vllm:e2e_request_latency_seconds_bucket{model="a",le="1"} 0\n'
+            'vllm:e2e_request_latency_seconds_bucket{model="b",le="1"} 0')
+        rows = frame(mlx_serve.sample("h", 1))
+        assert "p50 —" in next(l for l in rows if "E2E latency:" in l), "dup le must drop"
+        assert "p50 —" not in next(l for l in rows if l.startswith("│ TTFT:"))
+
+        # ---- ANE published as zero is off, and absent stays n/a ----
+        MUT["ane"] = 0
+        zero = metrics_text().replace("mlx_serve:ane_layers 12", "mlx_serve:ane_layers 0")
+        zero = zero.replace("mlx_serve:ane_int8_bytes 1073741824", "mlx_serve:ane_int8_bytes 0")
+        body["metrics"] = lambda z=zero: z
+        rows = frame(mlx_serve.sample("h", 1))
+        assert next(l for l in rows if "ANE layers" in l).rstrip().endswith("off")
+        MUT.pop("ane")
+        body["metrics"] = metrics_text
+
+        # ---- N1/N2: restart clears both windows and drops the stale prev ----
+        from collections import deque
+        state = {"history": deque(maxlen=8), "prev": None,
+                 "start_time": time.time() - 30, "rate_hist": deque()}
+        # seeded: with ticks milliseconds apart, min_gap would otherwise hide
+        # whether tick() really appends, and a missing clear() would go unnoticed
+        state["rate_hist"].append((time.time() - 60, 1.0, 1.0))
         mlx_serve.tick(FakeScr(120), Args, state)
         assert state["prev"]["restarted"] is False, state["prev"]
+        assert len(state["rate_hist"]) == 2, state["rate_hist"]
         START[0] += 0.5                       # jitter is not a restart
         mlx_serve.tick(FakeScr(120), Args, state)
         assert state["prev"]["restarted"] is False, state["prev"]
         assert len(state["history"]) == 2, state["history"]
-        START[0] += 100                       # the engine really restarted
-        mlx_serve.tick(FakeScr(120), Args, state)
+
+        START[0] += 100                       # a real restart, counters fall
+        MUT["prefill"] = 5
+        MUT["gen_live"] = 5
+        scr = FakeScr(120)
+        mlx_serve.tick(scr, Args, state)
         assert state["prev"]["restarted"] is True, state["prev"]
         assert len(state["history"]) == 1, "history must not straddle a restart"
-        # draw() re-appends one sample after the clear, so exactly one remains:
-        # the pre-restart samples must be gone
-        assert len(state["rate_hist"]) == 1, state["rate_hist"]
+        assert len(state["rate_hist"]) == 1, "old rate samples must be gone"
+        assert state["rate_hist"][0][0] == state["prev"]["t"], state["rate_hist"]
+        pp = next(l for l in scr.buf if "Prefill PP (wall)" in l)
+        tg = next(l for l in scr.buf if "Decode TG (wall)" in l)
+        # the pre-restart prev must not be used, or these would go negative
+        assert "—" in pp and "-" not in pp, pp
+        assert "—" in tg and "-" not in tg, tg
+        assert "(engine restarted)" in next(l for l in scr.buf if "Failed / rejected" in l)
+
+        # ---- N4: a missing start time is not a restart ----
+        MUT["drop_start"] = True
+        mlx_serve.tick(FakeScr(120), Args, state)
+        assert state["prev"]["restarted"] is False, state["prev"]
+        MUT.pop("drop_start")
+
+        # ---- N4: an unusable timestamp must not crash the dashboard ----
+        MUT["start"] = 1e18
+        scr = FakeScr(120)
+        mlx_serve.tick(scr, Args, state)
+        assert "unusable timestamp" in next(l for l in scr.buf if "Engine started:" in l)
+        MUT.pop("start")
 
         # alias == id must not print the same string twice
         MODELS["data"][0]["alias"] = MODELS["data"][0]["id"]
@@ -354,18 +427,18 @@ if __name__ == "__main__":
             assert abs(got - want) < 1e-6, (q, got, want)
 
         # 3) estimates are marked; an unobservable tail claims no exactness
-        strs = tf._quantile_strs(buckets, count)
+        strs = _common.quantile_strs(buckets, count)
         # p50 lands on the exact decimal tie 2.455 -> "2.46" (half-even inside the
         # interpolation). Deterministic for IEEE doubles, but it would move if the
         # arithmetic in percentile_from_buckets were reordered.
         assert strs == ["~2.46s", "~8.60s", "~37.95s"], strs
         # 10 of 20 observed inside the finite buckets: p50's target lands exactly on
         # the last finite count and interpolates ("~"), p90/p99 exceed it (">")
-        assert tf._quantile_strs({1.0: 5.0, 60.0: 10.0}, 20.0) == ["~60.00s", ">60.00s", ">60.00s"]
+        assert _common.quantile_strs({1.0: 5.0, 60.0: 10.0}, 20.0) == ["~60.00s", ">60.00s", ">60.00s"]
 
         # 4) honest gaps: nothing finished, or the server exposes no buckets
-        assert tf._quantile_strs(buckets, 0.0) == ["—", "—", "—"]
-        assert tf._quantile_strs({}, 588.0) == ["—", "—", "—"]
+        assert _common.quantile_strs(buckets, 0.0) == ["—", "—", "—"]
+        assert _common.quantile_strs({}, 588.0) == ["—", "—", "—"]
 
         def frame(c, rate_hist=None, width=100):
             scr = FakeScr(width)

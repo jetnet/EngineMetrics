@@ -80,7 +80,7 @@ exporter, no dependencies.
 |---|---|---|
 | **vLLM** | `vllm:*` keys in `/metrics` | Live PP/TG (engine-time + wall-clock, delta-sampled), 120s sparklines, batch shape (tokens/step), KV occupancy + pool tokens, prefix-cache hit rates (live + cumulative), MTP/spec acceptance with τ and per-position decay, ITL/TTFT/E2E/queue latency with p50/p90/p99 percentiles, preemption warnings, finish-reason accounting, scheduler fairness gauges, tool-call traffic profile, model card from `cache_config_info` |
 | **TensorFold** | `backend: "tensorfold"` in `/health` | Live PP/TG (engine-time + wall-clock), 120s sparklines, stream states, shared-pool occupancy, kept prompts, MTP acceptance + drafted/kept tokens per round, TTFT/latency averages plus p50/p90/p99 interpolated from the `/metrics` histogram buckets (`~` = estimate inside a coarse bucket, `>` = tail beyond the last finite bucket), cache-hit %, engine-reported `iteration_s`, multi-prefill stats, cache-reuse panel (kept bytes/mix, prefix waits, continued chats), SSD spill tier panel (stored/written/loaded/restored, fill bar via `--spill-cap`, restore p50/p95, failures, 120s restore sparkline) |
-| **mlx-serve** | `mlx_serve:*` keys in `/metrics` (checked before `vllm:*` — mlx-serve emits both) | Live TG/PP (wall-clock, from `*_live` gauges that include in-flight slots), in-flight prefill progress bar, GPU util + memory footprint, model card (arch/quant/ctx/MTP/resident), 120s sparklines, prefix-cache hit rates, TTFT/latency averages, serial-decode reasons |
+| **mlx-serve** | `mlx_serve:*` keys in `/metrics` (checked before `vllm:*` — mlx-serve emits both) | Live TG/PP (wall-clock, from `*_live` gauges that include in-flight slots), in-flight prefill progress bar, GPU util + memory footprint, model card (alias/id, arch/quant/ctx/MTP/resident), 120s sparklines, prefix-cache hit rates, TTFT/latency/E2E p50/p90/p99 from the histogram buckets (`~` = interpolated, `>` = tail beyond the last finite bucket), prompt/output token size distributions, failed/rejected counters with engine-restart detection, ANE prefill row, `/props` panel (memory, batching, MTP/PLD, engine settings) |
 | **oMLX** | `engine_pool` in `/health` (fallback: `models_discovered` in `/api/status`) | Live TG from per-slot `tokens_per_second` (in-flight), native prefill progress bar with ETA (`processed`/`total`/`speed`), loaded-model cards (engine_type/ctx/size), memory pool + pressure levels, cache efficiency, engine cumulative TPS averages, device info (chip/GPU cores), custom-kernel availability |
 | **Splash** | `splash_*` keys in `/metrics` (dashboard reads the JSON `/status` mirror) | Live PP/TG (engine-time + wall-clock, delta-sampled), 120s sparklines, scheduler streams + decode batch-width mix (b1–b4), admission queue, KV page-pool occupancy + extent stats, prompt-cache hit rate + state store, memory governor + thermal state, TTFT/ITL p50/p95, DFlash2 draft acceptance, last-batch detail, device card (chip/GPU cores/ANE split) |
 
@@ -211,13 +211,33 @@ dashboard uses the natives where they're strictly better:
   prefill tok/s numerator.
 - **Prefill progress** = `mlx_serve:prefill_tokens_live` / `mlx_serve:prefill_tokens_expected`
   — a live bar for the in-flight prefill; `idle` when nothing is prefilling.
-- **Model card** = first `loaded` entry in `/v1/models` (arch, quant, ctx, MTP,
-  resident bytes). Shows red `NOT LOADED` when the idle-evictor has unloaded
+- **Model card** = first `loaded` entry in `/v1/models`; the human `alias` is the
+  title and the hash `id` stays on its own line when both exist and differ
+  (entries without an alias show their readable id). Arch/quant/ctx/MTP/resident
+  bytes follow. Shows red `NOT LOADED` when the idle-evictor has unloaded
   everything.
 - **Prefix cache** — token hit rate = `mlx_serve:prefix_cache_tokens_total` /
   `vllm:prompt_tokens_total`; query hit rate = `vllm:prefix_cache_hits_total` /
   `vllm:prefix_cache_queries_total`.
-- **Averages** = `vllm:*` histogram sum ÷ count (E2E, TTFT, prefill, decode).
+- **Percentiles** = p50/p90/p99 interpolated from the cumulative `vllm:*` buckets
+  (E2E, TTFT, prefill, decode, and the prompt/output token size distributions).
+  `~` marks an estimate inside a coarse bucket, `>` a tail beyond the last finite
+  bucket where only a lower bound is knowable, `—` no buckets or no finished
+  requests. Averages come from the same histograms (sum ÷ count).
+- **Failed / rejected** = `mlx_serve:request_failed_total` /
+  `mlx_serve:request_rejected_total`; an absent counter reads `n/a`, never 0.
+- **Restarts** = a change in `mlx_serve:process_start_time_seconds` larger than 1s
+  flags `(engine restarted)` and clears the history and rate windows, so no rate
+  spans the counter reset. The timestamp itself renders under `Engine started`,
+  with `n/a` for absent or unusable values.
+- **ANE** = `mlx_serve:ane_layers` / `mlx_serve:ane_int8_bytes`; `off` only when
+  the engine publishes them as zero, `n/a` when they are absent.
+- **`/props` panel** = memory (peak/weights/kv/available, max safe context),
+  batching `max_group`, engine settings (version, kv_quant, prefill_chunk,
+  max_concurrent), MTP depth/adaptive, PLD draft/key length, and the
+  `prefix_cache` byte counters under their raw key names. Every field is
+  type-checked: missing or non-numeric values read `n/a`, and the panel is hidden
+  entirely when `/props` is unavailable or not an object.
 - **Serial decode** = `mlx_serve:decode_serial_total{reason=...}` breakdown
   (top 3 non-zero reasons) — why batched decode fell back to serial.
 - **GPU / footprint** = `mlx_serve:gpu_utilization_pct` and `mlx_serve:memory_mb`

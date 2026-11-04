@@ -5,7 +5,6 @@ cumulative counters are delta-sampled, vllm:* histograms give cumulative average
 """
 
 import curses
-import re
 import time
 from datetime import datetime
 
@@ -13,8 +12,8 @@ from .common import (
     COLOR_BORDER, COLOR_DIM, COLOR_GOOD, COLOR_GREEN, COLOR_RED, COLOR_TITLE,
     COLOR_VALUE, COLOR_WARN, append_rate_sample, avg_wall_rate, draw_bar_row, draw_box_end,
     draw_box_start, draw_row, fetch_json, fetch_metrics_labeled, format_bytes,
-    format_latency, format_num, format_speed, format_uptime, get_value, http_get,
-    percentile_from_buckets, quantile_strs, sparkline_fit, wall_rate,
+    format_latency, format_num, format_speed, format_uptime, get_value,
+    quantile_strs, sparkline_fit, wall_rate,
 )
 
 MLX_KEYS = [
@@ -110,20 +109,29 @@ def mlx_model_info(host, port):
     mm = fetch_json(host, port, "/v1/models")
     if not isinstance(mm, dict) or not mm.get("data"):
         return None
-    data = mm["data"]
+    data = [m for m in mm["data"] if isinstance(m, dict)]
+    if not data:
+        return None
     loaded = [m for m in data if m.get("loaded")] or data
     m = loaded[0]
-    meta = m.get("meta") or {}
+    meta = m.get("meta")
+    meta = meta if isinstance(meta, dict) else {}
+    alias = m.get("alias")
+    mod_id = m.get("id")
+    ctx = _num(m.get("context_length"))
+    if ctx is None:
+        ctx = _num(meta.get("context_length"))
+    resident = _num(m.get("bytes_resident"))
     return {
-        "id": m.get("id"),
+        "id": mod_id if isinstance(mod_id, str) and mod_id else None,
         # mlx-serve exposes a human name in `alias` and a hash in `id`; entries
         # without an alias (e.g. mlx-community/...) have a readable id instead
-        "alias": m.get("alias"),
+        "alias": alias if isinstance(alias, str) and alias else None,
         "arch": meta.get("architecture"),
         "quant": meta.get("quantization"),
-        "ctx": m.get("context_length") or meta.get("context_length") or 0,
+        "ctx": ctx or 0,
         "mtp": bool(meta.get("mtp_loaded")),
-        "resident": m.get("bytes_resident") or 0,
+        "resident": resident or 0,
         "loaded": bool(m.get("loaded")),
     }
 
@@ -185,8 +193,8 @@ def tick(stdscr, args, state):
                 state["rate_hist"].clear()
         else:
             state["history"].append(cur)
-    draw(stdscr, cur, prev, state["history"], state["start_time"],
-         args.host, args.port, args.interval, state["rate_hist"])
+    draw(stdscr, cur, None if cur.get("restarted") else prev, state["history"],
+         state["start_time"], args.host, args.port, args.interval, state["rate_hist"])
     state["prev"] = cur if not cur.get("_error") else prev
 
 
@@ -460,7 +468,7 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
             rows.append(("Available:", f"{_b(mem, 'available_bytes')}   "
                                        f"max safe ctx {_n(mem, 'max_safe_context')}"))
         if sets or bat:
-            rows.append(("Engine:", f"v{sets.get('version') or 'n/a'}  "
+            rows.append(("Engine:", f"version {sets.get('version') or 'n/a'}  "
                                     f"kv_quant {sets.get('kv_quant') or 'n/a'}  "
                                     f"chunk {_n(sets, 'prefill_chunk')}  "
                                     f"max_group {_n(bat, 'max_group')}  "
