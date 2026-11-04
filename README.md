@@ -136,8 +136,9 @@ delta-samples between polls:
   last finite bucket (only a lower bound is knowable), `—` means the server
   exposes no buckets or nothing has finished yet. These are lifetime-cumulative,
   not windowed. Assumption: one label set per histogram (verified against the
-  engine this was built on); several label sets render `—` instead of silently
-  mixing series.
+  engine this was built on); with several label sets the percentiles render `—`
+  rather than a silently mixed series (the average and `n` still come from the
+  flat last-wins sum/count).
 
 ## How the vLLM numbers are derived
 

@@ -168,6 +168,10 @@ if __name__ == "__main__":
         assert sorted(buckets) == [1.0, 2.5, 5.0, 10.0, 30.0, 60.0, float("inf")], buckets
         assert buckets[float("inf")] == 588.0, buckets
         assert tf._buckets({}, "x") == {}, "absent histogram must yield {}"
+        # several label sets on one histogram: refuse to mix, render gaps instead
+        dup = {"x_bucket": [({'le': '1', 'm': 'a'}, 1.0),
+                            ({'le': '1', 'm': 'b'}, 2.0)]}
+        assert tf._buckets(dup, "x") == {}, "duplicate le bound must not mix series"
 
         # 2) the maths, checked against the algorithm, not against a string
         count = cur["tensorfold:request_latency_seconds_count"]
@@ -177,6 +181,9 @@ if __name__ == "__main__":
 
         # 3) estimates are marked; an unobservable tail claims no exactness
         strs = tf._quantile_strs(buckets, count)
+        # p50 lands on the exact decimal tie 2.455 -> "2.46" (half-even inside the
+        # interpolation). Deterministic for IEEE doubles, but it would move if the
+        # arithmetic in percentile_from_buckets were reordered.
         assert strs == ["~2.46s", "~8.60s", "~37.95s"], strs
         # 10 of 20 observed inside the finite buckets: p50's target lands exactly on
         # the last finite count and interpolates ("~"), p90/p99 exceed it (">")

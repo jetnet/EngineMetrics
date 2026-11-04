@@ -62,8 +62,9 @@ def _buckets(series, base):
 
     ASSUMPTION: one label set per histogram. Verified against the live engine
     (jetspark01:8045): the only label is `le`; buckets are cumulative and the
-    '+Inf' bucket equals `_count`. With several label sets the last one would
-    win, so a multi-tenant server would need summing here and in the count.
+    '+Inf' bucket equals `_count`. Several label sets on one histogram yield {}
+    (the percentiles then render as em dashes) rather than a silently mixed
+    series.
     """
     out = {}
     for labels, v in series.get(base + "_bucket", []):
