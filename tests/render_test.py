@@ -1,6 +1,6 @@
 """Headless render test: one clean frame per engine backend (live where reachable).
 
-Usage: python3 tests/render_test.py [omlx|mlx-serve|vllm|vllm-synthetic|tensorfold|
+Usage: python3 tests/render_test.py [mlx-robust|omlx|mlx-serve|vllm|vllm-synthetic|tensorfold|
          tensorfold-synthetic|tensorfold-robust|splash|splash-synthetic|
          splash-fresh|splash-robust] [host [port]]
 """
@@ -211,6 +211,10 @@ if __name__ == "__main__":
         pre = next(l for l in rows if l.startswith("│ Prefill:"))
         dec = next(l for l in rows if l.startswith("│ Decode:"))
         assert "(n=8)" in pre and "(n=9)" in dec, (pre, dec)
+        # MINOR-1: pin the bucket values, not only the counts, so a swapped
+        # histogram key cannot pass on the shared (n=..) text
+        assert "p50 ~4.00s" in pre, pre
+        assert "p99 ~11.82s" in dec, dec
         assert "adaptive True" in next(l for l in rows if "Speculation:" in l)
 
         # ---- N4: junk /props types read n/a, they neither crash nor invent ----
@@ -236,13 +240,11 @@ if __name__ == "__main__":
         assert "p50 —" not in next(l for l in rows if l.startswith("│ TTFT:"))
 
         # ---- ANE published as zero is off, and absent stays n/a ----
-        MUT["ane"] = 0
         zero = metrics_text().replace("mlx_serve:ane_layers 12", "mlx_serve:ane_layers 0")
         zero = zero.replace("mlx_serve:ane_int8_bytes 1073741824", "mlx_serve:ane_int8_bytes 0")
         body["metrics"] = lambda z=zero: z
         rows = frame(mlx_serve.sample("h", 1))
         assert next(l for l in rows if "ANE layers" in l).rstrip().endswith("off")
-        MUT.pop("ane")
         body["metrics"] = metrics_text
 
         # ---- N1/N2: restart clears both windows and drops the stale prev ----
@@ -288,6 +290,38 @@ if __name__ == "__main__":
         mlx_serve.tick(scr, Args, state)
         assert "unusable timestamp" in next(l for l in scr.buf if "Engine started:" in l)
         MUT.pop("start")
+
+        # ---- MINOR-3: an undetected restart must not print negative rates ----
+        # The start metric is absent, so the restart cannot be detected; the
+        # safe rate must still refuse the backward delta, and so must the window
+        # average, because counters never decrease.
+        MUT["drop_start"] = True
+        MUT["prefill"] = 100
+        MUT["gen_live"] = 90
+        st2 = {"history": deque(maxlen=8), "prev": None,
+               "start_time": time.time() - 30, "rate_hist": deque()}
+        mlx_serve.tick(FakeScr(120), Args, st2)
+        MUT["prefill"] = 5
+        MUT["gen_live"] = 5
+        scr2 = FakeScr(120)
+        mlx_serve.tick(scr2, Args, st2)
+        assert st2["prev"]["restarted"] is False, st2["prev"]
+        pp2 = next(l for l in scr2.buf if "Prefill PP (wall)" in l)
+        tg2 = next(l for l in scr2.buf if "Decode TG (wall)" in l)
+        assert "—" in pp2 and "-" not in pp2, pp2
+        assert "—" in tg2 and "-" not in tg2, tg2
+        MUT.pop("drop_start")
+        MUT.pop("prefill")
+        MUT.pop("gen_live")
+
+        # ---- MINOR-2: junk /v1/models must not crash the card or the frame ----
+        MODELS["data"] = [{"id": 5, "alias": True, "meta": "x", "context_length": "8"}]
+        bad = mlx_serve.sample("h", 1)
+        assert bad["model"]["arch"] is None and bad["model"]["ctx"] == 0, bad["model"]
+        frame(bad)                       # must not raise
+        MODELS["data"] = 5               # not a list at all
+        assert mlx_serve.sample("h", 1)["model"] is None
+        MODELS["data"] = [{"id": "abc123", "loaded": True, "meta": {}}]
 
         # alias == id must not print the same string twice
         MODELS["data"][0]["alias"] = MODELS["data"][0]["id"]

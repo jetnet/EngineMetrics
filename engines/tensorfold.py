@@ -95,8 +95,6 @@ def _buckets(series, base):
     return out
 
 
-
-
 # /health "spill" dict (patch 0088 disk tier) — flattened as spill_<field> so
 # delta-rate math sees flat counters. Older engines without the tier simply
 # don't set spill_present.

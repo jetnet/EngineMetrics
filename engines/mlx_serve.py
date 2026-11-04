@@ -13,7 +13,7 @@ from .common import (
     COLOR_VALUE, COLOR_WARN, append_rate_sample, avg_wall_rate, draw_bar_row, draw_box_end,
     draw_box_start, draw_row, fetch_json, fetch_metrics_labeled, format_bytes,
     format_latency, format_num, format_speed, format_uptime, get_value,
-    quantile_strs, sparkline_fit, wall_rate,
+    quantile_strs, sparkline_fit, wall_rate, wall_rate_safe,
 )
 
 MLX_KEYS = [
@@ -107,7 +107,7 @@ def _pcts(cur, base, total, fmt=None):
 def mlx_model_info(host, port):
     """Loaded model card from /v1/models (mlx-serve lists all with loaded/state)."""
     mm = fetch_json(host, port, "/v1/models")
-    if not isinstance(mm, dict) or not mm.get("data"):
+    if not isinstance(mm, dict) or not isinstance(mm.get("data"), list):
         return None
     data = [m for m in mm["data"] if isinstance(m, dict)]
     if not data:
@@ -127,8 +127,8 @@ def mlx_model_info(host, port):
         # mlx-serve exposes a human name in `alias` and a hash in `id`; entries
         # without an alias (e.g. mlx-community/...) have a readable id instead
         "alias": alias if isinstance(alias, str) and alias else None,
-        "arch": meta.get("architecture"),
-        "quant": meta.get("quantization"),
+        "arch": meta.get("architecture") if isinstance(meta.get("architecture"), str) else None,
+        "quant": meta.get("quantization") if isinstance(meta.get("quantization"), str) else None,
         "ctx": ctx or 0,
         "mtp": bool(meta.get("mtp_loaded")),
         "resident": resident or 0,
@@ -266,12 +266,19 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
 
     # ---- Live throughput (delta-sampled) ----
     # generation_tokens_live is a gauge that includes in-flight slots → true wall rate
-    tg_live = wall_rate(cur, prev, "mlx_serve:generation_tokens_live")
+    tg_live = wall_rate_safe(cur, prev, "mlx_serve:generation_tokens_live")
     # prefill_tokens_total counts only actually-computed prefill tokens (excludes
     # prefix-cache restores) → the correct prefill tok/s numerator
-    pp_wall = wall_rate(cur, prev, "mlx_serve:prefill_tokens_total")
+    pp_wall = wall_rate_safe(cur, prev, "mlx_serve:prefill_tokens_total")
     tg_avg = avg_wall_rate(history, "mlx_serve:generation_tokens_live")
     pp_avg = avg_wall_rate(history, "mlx_serve:prefill_tokens_total")
+    # Counters cannot go backwards. A negative window average means the engine
+    # restarted without the start-time metric to prove it, so the rate is
+    # unknowable rather than negative.
+    if tg_avg is not None and tg_avg < 0:
+        tg_avg = None
+    if pp_avg is not None and pp_avg < 0:
+        pp_avg = None
 
     if rate_hist is not None:
         # one point per sampling tick (see common.append_rate_sample)
@@ -325,17 +332,21 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     # ---- Prefix cache ----
     ptok = cur["vllm:prompt_tokens_total"]
     restored = cur["mlx_serve:prefix_cache_tokens_total"]
-    tok_hit = restored / ptok * 100 if ptok else 0.0
+    tok_hit = restored / ptok * 100 if ptok else None
     hits = cur["vllm:prefix_cache_hits_total"]
     queries = cur["vllm:prefix_cache_queries_total"]
-    q_hit = hits / queries * 100 if queries else 0.0
+    q_hit = hits / queries * 100 if queries else None
 
     draw_box_start(stdscr, y, x, width, "Prefix Cache")
     y += 1
-    tok_color = COLOR_GREEN if tok_hit >= 70 else COLOR_WARN
-    draw_row(stdscr, y, x, "Token hit rate:", f"{tok_hit:.1f}%  ({format_num(restored)}/{format_num(ptok)} restored)", width, value_color=tok_color)
+    tok_color = COLOR_DIM if tok_hit is None else (COLOR_GREEN if tok_hit >= 70 else COLOR_WARN)
+    draw_row(stdscr, y, x, "Token hit rate:",
+             f"{'—' if tok_hit is None else f'{tok_hit:.1f}%'}  "
+             f"({format_num(restored)}/{format_num(ptok)} restored)", width, value_color=tok_color)
     y += 1
-    draw_row(stdscr, y, x, "Query hit rate:", f"{q_hit:.1f}%  ({int(hits)}/{int(queries)})", width)
+    draw_row(stdscr, y, x, "Query hit rate:",
+             f"{'—' if q_hit is None else f'{q_hit:.1f}%'}  ({int(hits)}/{int(queries)})",
+             width, value_color=COLOR_DIM if q_hit is None else COLOR_VALUE)
     y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
@@ -435,15 +446,20 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     draw_row(stdscr, y, x, "Engine started:", started_txt,
              width, value_color=COLOR_DIM if not started else COLOR_VALUE)
     y += 1
-    ane_seen = ("mlx_serve:ane_layers" in present) or ("mlx_serve:ane_int8_bytes" in present)
+    layers_seen = "mlx_serve:ane_layers" in present
+    bytes_seen = "mlx_serve:ane_int8_bytes" in present
     ane_layers = cur["mlx_serve:ane_layers"]
     ane_bytes = cur["mlx_serve:ane_int8_bytes"]
-    if not ane_seen:
+    if not layers_seen and not bytes_seen:
         ane_txt, ane_color = "n/a", COLOR_DIM
-    elif ane_layers or ane_bytes:
-        ane_txt, ane_color = f"{int(ane_layers)} layers  {format_bytes(ane_bytes)}B", COLOR_VALUE
-    else:
+    elif layers_seen and bytes_seen and not ane_layers and not ane_bytes:
         ane_txt, ane_color = "off", COLOR_DIM
+    else:
+        # each half is judged by its own presence: one published metric must not
+        # make the missing one look like a real zero
+        ltxt = f"{int(ane_layers)}" if layers_seen else "n/a"
+        btxt = (format_bytes(ane_bytes) + "B") if bytes_seen else "n/a"
+        ane_txt, ane_color = f"{ltxt} layers  {btxt}", COLOR_VALUE
     draw_row(stdscr, y, x, "ANE layers / int8 bytes:", ane_txt, width, value_color=ane_color)
     y += 1
     draw_box_end(stdscr, y, x, width)
