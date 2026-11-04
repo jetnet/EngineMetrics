@@ -65,6 +65,80 @@ if __name__ == "__main__":
         cur = mlx_serve.sample(host, port)
         render("mlx-serve live :%d" % port, lambda scr: mlx_serve.draw(
             scr, cur, None, [cur], time.time() - 60, host, port, 2, rate_hist=None))
+    elif which == "mlx-robust":
+        # asserts instead of printing a frame: alias fallback, the '>' lower-bound
+        # marker, failure/restart/ANE rows and the /props panel, driven through
+        # sample() with patched fetchers (no network)
+        FLAT = {k: 0.0 for k in mlx_serve.MLX_KEYS}
+        FLAT.update({
+            "mlx_serve:request_failed_total": 2.0,
+            "mlx_serve:request_rejected_total": 1.0,
+            "mlx_serve:process_start_time_seconds": 1700000000.0,
+            "mlx_serve:ane_layers": 0.0,
+            "mlx_serve:ane_int8_bytes": 0.0,
+            "vllm:request_prompt_tokens_sum": 1000.0,
+            "vllm:request_prompt_tokens_count": 9.0,
+            "vllm:request_generation_tokens_sum": 450.0,
+            "vllm:request_generation_tokens_count": 9.0,
+            "vllm:e2e_request_latency_seconds_count": 9.0,
+            "vllm:time_to_first_token_seconds_count": 9.0,
+            "vllm:request_prefill_time_seconds_count": 9.0,
+            "vllm:request_decode_time_seconds_count": 9.0,
+        })
+        # last finite bucket holds only 4 of 9 observations -> quantiles are bounds
+        SERIES = {base + "_bucket": [
+            ({"le": "1"}, 2.0), ({"le": "5"}, 4.0),
+            ({"le": "10"}, 4.0), ({"le": "+Inf"}, 9.0),
+        ] for base in mlx_serve.HISTOGRAMS}
+        PROPS = {
+            "memory": {"peak_bytes": 8 * 2 ** 30, "weights_bytes": 4 * 2 ** 30,
+                       "kv_cache_bytes": 2 ** 30, "available_bytes": 3 * 2 ** 30,
+                       "max_safe_context": 96501},
+            "batching": {"max_group": 32},
+            "settings": {"version": "26.11.1", "kv_quant": "off", "prefill_chunk": 8192,
+                         "max_concurrent": 3, "mtp": {"depth": 6, "adaptive": True},
+                         "pld": {"draft_len": 5, "key_len": 3},
+                         "prefix_cache": {"mem_bytes": 2 ** 31, "disk_bytes": 0}},
+        }
+        MODELS = {"data": [{"id": "abc123", "alias": "Pretty-Name", "loaded": True,
+                            "context_length": 1000, "bytes_resident": 2 ** 30,
+                            "meta": {"architecture": "arch", "quantization": "4-bit"}}]}
+        mlx_serve.fetch_metrics_labeled = lambda h, p, keep_buckets=False: (FLAT, SERIES, None)
+        mlx_serve.fetch_json = lambda h, p, path: PROPS if path == "/props" else MODELS
+        mlx_serve.http_get = lambda url, timeout=5: ""     # no serial-decode reasons
+
+        cur = mlx_serve.sample("h", 1)
+        assert cur["buckets"]["vllm:e2e_request_latency_seconds"][float("inf")] == 9.0
+        assert cur["props"]["settings"]["mtp"]["depth"] == 6, cur["props"]
+        assert cur["mlx_serve:request_failed_total"] == 2.0, cur
+
+        def mlx_frame(c):
+            scr = FakeScr(120)
+            mlx_serve.draw(scr, c, None, [c], time.time() - 60, "h", 1, 2, rate_hist=None)
+            return scr.buf
+
+        rows = mlx_frame(cur)
+        joined = "\n".join(rows)
+        assert "Pretty-Name" in joined and "id abc123" in joined, joined[:400]
+        lat = next(l for l in rows if "E2E latency:" in l)
+        assert ">10.00s" in lat and "~" not in lat, lat     # bound, not fake 10.00s
+        tot = next(l for l in rows if "Failed / rejected:" in l)
+        assert "2 failed" in tot and "1 rejected" in tot, tot
+        assert "off" in next(l for l in rows if "ANE prefill:" in l)
+        assert "max safe ctx 96.5K" in next(l for l in rows if "Available:" in l)
+        assert "MTP depth 6" in joined and "PLD draft 5" in joined, joined
+        assert "Engine started:" in joined, joined
+
+        # no /props -> panel hidden; entry without alias -> readable id, no dup line
+        mlx_serve.fetch_json = lambda h, p, path: (
+            None if path == "/props"
+            else {"data": [{"id": "readable/id", "loaded": False, "meta": {}}]})
+        cur2 = mlx_serve.sample("h", 1)
+        rows2 = mlx_frame(cur2)
+        assert not any("Memory & settings" in l for l in rows2), "props panel must hide"
+        assert "readable/id" in "\n".join(rows2), "alias-less entry must show its id"
+        assert not any("id readable/id" in l for l in rows2), "no duplicate id line"
+        print("mlx robust: OK")
     elif which in ("tensorfold", "tensorfold-synthetic"):
         import engines.tensorfold as tf
         from collections import deque
