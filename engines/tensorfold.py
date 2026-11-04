@@ -10,8 +10,8 @@ from .common import (
     COLOR_BORDER, COLOR_DIM, COLOR_GOOD, COLOR_GREEN, COLOR_HEADER, COLOR_RED,
     COLOR_TITLE, COLOR_WARN, avg_rate, avg_wall_rate, draw_bar_row, draw_box_end,
     draw_box_start, draw_row, draw_two_col_row, fetch_json, fetch_metrics_labeled,
-    format_bytes, format_num, format_speed, format_uptime, get_value,
-    prune_rate_hist, rate, sparkline, wall_rate, wall_rate_safe,
+    format_bytes, format_latency, format_num, format_speed, format_uptime, get_value,
+    percentile_from_buckets, prune_rate_hist, rate, sparkline, wall_rate, wall_rate_safe,
 )
 
 TF_COUNTERS = [
@@ -55,6 +55,24 @@ def _num(v):
     return v if v == v and abs(v) != float("inf") else 0.0
 
 
+def _buckets(series, base):
+    """{upper_bound: cumulative_count} for one histogram, '+Inf' dropped by the
+    caller's percentile helper. Absent server-side (no keep_buckets scrape) -> {}."""
+    out = {}
+    for labels, v in series.get(base + "_bucket", []):
+        try:
+            out[float(labels.get("le"))] = _num(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _quantiles(buckets, total, qs=(0.5, 0.9, 0.99)):
+    """Estimated percentiles from cumulative buckets; None where the server
+    exposes no histogram (draw() then renders an em dash)."""
+    return [percentile_from_buckets(buckets or {}, total, q) for q in qs]
+
+
 # /health "spill" dict (patch 0088 disk tier) — flattened as spill_<field> so
 # delta-rate math sees flat counters. Older engines without the tier simply
 # don't set spill_present.
@@ -67,7 +85,9 @@ SPILL_FIELDS = [
 
 def sample(host, port):
     """One TensorFold sample: wall time + counters from /metrics + /health."""
-    metrics, series, _ = fetch_metrics_labeled(host, port)
+    # keep_buckets: the two histograms' buckets are the only source for tail
+    # latency — the dashboard used to show sum/count averages only.
+    metrics, series, _ = fetch_metrics_labeled(host, port, keep_buckets=True)
     health = fetch_json(host, port, "/health")
     if not isinstance(health, dict):
         health = {}
@@ -107,6 +127,8 @@ def sample(host, port):
                                            get_value(metrics, "tensorfold:num_requests_waiting")))
     s["kv_ratios"] = [(lb.get("pool", lb.get("stream", "?")), _num(v))
                       for lb, v in series.get("tensorfold:kv_cache_usage_ratio", [])]
+    s["lat_buckets"] = _buckets(series, "tensorfold:request_latency_seconds")
+    s["ttft_buckets"] = _buckets(series, "tensorfold:time_to_first_token_seconds")
     s["streams"] = health.get("streams", {}) or {}
     s["multi_prefill"] = health.get("multi_prefill", {}) or {}
     live = health.get("live")
@@ -354,9 +376,15 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
 
     draw_box_start(stdscr, y, x, width, "Averages (cumulative)")
     y += 1
-    draw_row(stdscr, y, x, "Avg Latency:", f"{avg_lat:.2f}s  (n={int(lat_n)})", width)
+    lat_q = _quantiles(cur.get("lat_buckets"), lat_n)
+    ttft_q = _quantiles(cur.get("ttft_buckets"), ttft_n)
+    draw_row(stdscr, y, x, "Latency:",
+             f"avg {format_latency(avg_lat)}   p50 {format_latency(lat_q[0])}  "
+             f"p90 {format_latency(lat_q[1])}  p99 {format_latency(lat_q[2])}  (n={int(lat_n)})", width)
     y += 1
-    draw_row(stdscr, y, x, "Avg TTFT:", f"{avg_ttft:.2f}s  (n={int(ttft_n)})", width)
+    draw_row(stdscr, y, x, "TTFT:",
+             f"avg {format_latency(avg_ttft)}   p50 {format_latency(ttft_q[0])}  "
+             f"p90 {format_latency(ttft_q[1])}  p99 {format_latency(ttft_q[2])}  (n={int(ttft_n)})", width)
     y += 1
     acc_color = COLOR_GREEN if acc_rate >= 70 else COLOR_WARN if acc_rate >= 50 else COLOR_RED
     if not drafted:

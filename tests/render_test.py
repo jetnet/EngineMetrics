@@ -92,7 +92,13 @@ if __name__ == "__main__":
                  "tensorfold:request_latency_seconds_sum": 5998.0,
                  "tensorfold:request_latency_seconds_count": 588.0,
                  "tensorfold:time_to_first_token_seconds_sum": 1087.0,
-                 "tensorfold:time_to_first_token_seconds_count": 588.0}
+                 "tensorfold:time_to_first_token_seconds_count": 588.0,
+                 # cumulative histogram buckets (post-sample() shape) so the
+                 # percentile rows interpolate instead of showing em dashes
+                 "lat_buckets": {1.0: 100.0, 2.5: 300.0, 5.0: 450.0, 10.0: 560.0,
+                                 30.0: 580.0, 60.0: 588.0, float("inf"): 588.0},
+                 "ttft_buckets": {0.5: 50.0, 1.0: 200.0, 2.5: 470.0, 5.0: 560.0,
+                                  10.0: 585.0, float("inf"): 588.0}}
             s.update(over)
             return s
 

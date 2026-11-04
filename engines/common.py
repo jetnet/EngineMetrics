@@ -198,6 +198,16 @@ def format_bytes(n):
     return f"{n:.0f}"
 
 
+def format_latency(seconds):
+    """Sub-second values as ms, larger ones as s; None renders as an em dash
+    (histogram percentiles are absent when a server exposes no buckets)."""
+    if seconds is None:
+        return "—"
+    if seconds >= 1.0:
+        return f"{seconds:.2f}s"
+    return f"{seconds * 1000:.0f}ms"
+
+
 # ---------------- box/row drawing ----------------
 
 def draw_box_start(stdscr, y, x, width, title, color=COLOR_BORDER):
