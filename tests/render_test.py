@@ -183,6 +183,9 @@ if __name__ == "__main__":
         assert "12 layers" in next(l for l in rows if "ANE layers" in l)
         assert "MTP depth 6" in joined and "PLD draft 5" in joined, joined
         assert "max safe ctx 96.5K" in next(l for l in rows if "Available:" in l)
+        # zero queries must read as an em dash, not a fabricated 0.0%
+        q_row = next(l for l in rows if "Query hit rate:" in l)
+        assert "—" in q_row and "0.0%" not in q_row, q_row
 
         # A counter the engine does not publish must read n/a, never a fake 0.
         body["metrics"] = "\n".join(
@@ -245,6 +248,11 @@ if __name__ == "__main__":
         body["metrics"] = lambda z=zero: z
         rows = frame(mlx_serve.sample("h", 1))
         assert next(l for l in rows if "ANE layers" in l).rstrip().endswith("off")
+        # one metric published, the other absent: the missing half is n/a, not 0B
+        one = metrics_text().replace("mlx_serve:ane_int8_bytes 1073741824\n", "")
+        body["metrics"] = lambda o=one: o
+        ane1 = next(l for l in frame(mlx_serve.sample("h", 1)) if "ANE layers" in l)
+        assert "12 layers" in ane1 and "n/a" in ane1, ane1
         body["metrics"] = metrics_text
 
         # ---- N1/N2: restart clears both windows and drops the stale prev ----
@@ -306,6 +314,9 @@ if __name__ == "__main__":
         scr2 = FakeScr(120)
         mlx_serve.tick(scr2, Args, st2)
         assert st2["prev"]["restarted"] is False, st2["prev"]
+        # pin a positive dt: a zero dt would make the average None before the
+        # clamp and the test would pass without exercising it
+        assert st2["history"][1]["t"] > st2["history"][0]["t"], st2["history"]
         pp2 = next(l for l in scr2.buf if "Prefill PP (wall)" in l)
         tg2 = next(l for l in scr2.buf if "Decode TG (wall)" in l)
         assert "—" in pp2 and "-" not in pp2, pp2
@@ -315,12 +326,20 @@ if __name__ == "__main__":
         MUT.pop("gen_live")
 
         # ---- MINOR-2: junk /v1/models must not crash the card or the frame ----
-        MODELS["data"] = [{"id": 5, "alias": True, "meta": "x", "context_length": "8"}]
-        bad = mlx_serve.sample("h", 1)
-        assert bad["model"]["arch"] is None and bad["model"]["ctx"] == 0, bad["model"]
-        frame(bad)                       # must not raise
+        MODELS["data"] = [{"id": 5, "alias": True,
+                           "meta": {"architecture": True, "quantization": 4},
+                           "bytes_resident": "9", "context_length": 128, "loaded": True}]
+        bad = mlx_serve.sample("h", 1)["model"]
+        assert bad["id"] is None and bad["alias"] is None, bad
+        assert bad["arch"] is None and bad["quant"] is None, bad
+        assert bad["resident"] == 0 and bad["ctx"] == 128, bad
+        frame(mlx_serve.sample("h", 1))          # must not raise
+        MODELS["data"] = [{"id": "x", "meta": "not a dict", "loaded": True}]
+        assert mlx_serve.sample("h", 1)["model"]["arch"] is None
         MODELS["data"] = 5               # not a list at all
         assert mlx_serve.sample("h", 1)["model"] is None
+        no_card = "\n".join(frame(mlx_serve.sample("h", 1)))
+        assert "unknown" in no_card and "(loaded)" not in no_card, no_card[:400]
         MODELS["data"] = [{"id": "abc123", "loaded": True, "meta": {}}]
 
         # alias == id must not print the same string twice

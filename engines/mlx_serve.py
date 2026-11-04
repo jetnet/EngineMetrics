@@ -13,7 +13,7 @@ from .common import (
     COLOR_VALUE, COLOR_WARN, append_rate_sample, avg_wall_rate, draw_bar_row, draw_box_end,
     draw_box_start, draw_row, fetch_json, fetch_metrics_labeled, format_bytes,
     format_latency, format_num, format_speed, format_uptime, get_value,
-    quantile_strs, sparkline_fit, wall_rate, wall_rate_safe,
+    quantile_strs, sparkline_fit, wall_rate_safe,
 )
 
 MLX_KEYS = [
@@ -78,7 +78,11 @@ def _num(v):
     """
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    if v != v or v in (float("inf"), float("-inf")):
+    try:
+        f = float(v)
+    except (OverflowError, ValueError):
+        return None          # 10**400 is finite to Python but overflows a float
+    if f != f or f in (float("inf"), float("-inf")):
         return None
     return v
 
@@ -238,14 +242,19 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     y += 1
 
     # ---- Model ----
-    model = cur.get("model") or {}
+    raw_model = cur.get("model")
+    has_model = isinstance(raw_model, dict) and bool(raw_model)
+    model = raw_model if has_model else {}
     draw_box_start(stdscr, y, x, width, "Model")
     y += 1
     mstate = "loaded" if model.get("loaded", True) else "NOT LOADED"
-    mcolor = COLOR_VALUE if model.get("loaded", True) else COLOR_RED
+    mcolor = (COLOR_VALUE if model.get("loaded", True) else COLOR_RED) if has_model else COLOR_DIM
     alias = model.get("alias")
     mod_id = model.get("id")
-    draw_row(stdscr, y, x, "", f"{alias or mod_id or 'unknown'}  ({mstate})", width, value_color=mcolor)
+    # without a card there is no load state to report, so do not claim one
+    name = alias or mod_id or "unknown"
+    draw_row(stdscr, y, x, "", f"{name}  ({mstate})" if has_model else name,
+             width, value_color=mcolor)
     y += 1
     if alias and mod_id and alias != mod_id:
         # keep the hash reachable without crowding the readable name
@@ -272,9 +281,9 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     pp_wall = wall_rate_safe(cur, prev, "mlx_serve:prefill_tokens_total")
     tg_avg = avg_wall_rate(history, "mlx_serve:generation_tokens_live")
     pp_avg = avg_wall_rate(history, "mlx_serve:prefill_tokens_total")
-    # Counters cannot go backwards. A negative window average means the engine
-    # restarted without the start-time metric to prove it, so the rate is
-    # unknowable rather than negative.
+    # A negative delta means the underlying counter or gauge reset (an engine
+    # restart the start-time metric could not prove, or a cancelled in-flight
+    # slot). Either way the rate is unknowable, not negative.
     if tg_avg is not None and tg_avg < 0:
         tg_avg = None
     if pp_avg is not None and pp_avg < 0:
@@ -330,9 +339,12 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     y += 1
 
     # ---- Prefix cache ----
+    present = cur.get("present") or set()
     ptok = cur["vllm:prompt_tokens_total"]
-    restored = cur["mlx_serve:prefix_cache_tokens_total"]
-    tok_hit = restored / ptok * 100 if ptok else None
+    # an absent counter is not a zero: say n/a instead of a 0% hit rate
+    restored = (cur["mlx_serve:prefix_cache_tokens_total"]
+                if "mlx_serve:prefix_cache_tokens_total" in present else None)
+    tok_hit = restored / ptok * 100 if (ptok and restored is not None) else None
     hits = cur["vllm:prefix_cache_hits_total"]
     queries = cur["vllm:prefix_cache_queries_total"]
     q_hit = hits / queries * 100 if queries else None
@@ -342,7 +354,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     tok_color = COLOR_DIM if tok_hit is None else (COLOR_GREEN if tok_hit >= 70 else COLOR_WARN)
     draw_row(stdscr, y, x, "Token hit rate:",
              f"{'—' if tok_hit is None else f'{tok_hit:.1f}%'}  "
-             f"({format_num(restored)}/{format_num(ptok)} restored)", width, value_color=tok_color)
+             f"({format_num(restored) if restored is not None else 'n/a'}/"
+             f"{format_num(ptok)} restored)", width, value_color=tok_color)
     y += 1
     draw_row(stdscr, y, x, "Query hit rate:",
              f"{'—' if q_hit is None else f'{q_hit:.1f}%'}  ({int(hits)}/{int(queries)})",
@@ -418,7 +431,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
              f"{format_num(cur['vllm:prompt_tokens_total'])} / {format_num(cur['vllm:generation_tokens_total'])}", width)
     y += 1
     draw_row(stdscr, y, x, "Prefill computed / cache-restored:",
-             f"{format_num(cur['mlx_serve:prefill_tokens_total'])} / {format_num(restored)}", width)
+             f"{format_num(cur['mlx_serve:prefill_tokens_total'])} / "
+             f"{format_num(restored) if restored is not None else 'n/a'}", width)
     y += 1
     serial = cur.get("decode_serial") or {}
     tops = sorted(((k, v) for k, v in serial.items() if v > 0), key=lambda kv: -kv[1])[:3]

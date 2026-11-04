@@ -229,7 +229,9 @@ dashboard uses the natives where they're strictly better:
 - **Restarts** = a change in `mlx_serve:process_start_time_seconds` larger than 1s
   flags `(engine restarted)` and clears the history and rate windows, so no rate
   spans the counter reset. The timestamp itself renders under `Engine started`,
-  with `n/a` for absent or unusable values.
+  with `n/a` for absent or unusable values. A backward delta that no restart
+  explains (a counter reset the start metric cannot prove, or a cancelled
+  in-flight slot) renders `—`, never a negative rate.
 - **ANE** = `mlx_serve:ane_layers` / `mlx_serve:ane_int8_bytes`; `off` only when
   the engine publishes them as zero, `n/a` when they are absent.
 - **`/props` panel** = memory (peak/weights/kv/available, max safe context),
