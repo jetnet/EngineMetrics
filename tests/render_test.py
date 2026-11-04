@@ -269,7 +269,7 @@ if __name__ == "__main__":
         # 7) sparkline window: one point per tick, and it must not grow on a
         #    redraw (the entrypoint re-samples on every key/mouse-wheel event)
         from engines.common import append_rate_sample, sparkline, sparkline_fit
-        # real-ish timestamps: append_rate_sample prunes against wall clock
+        # synthetic timestamps: pruning follows the sample clock, so these survive
         base = time.time()
         h = deque()
         assert append_rate_sample(h, base, 1.0, 2.0, min_gap=1.8) is True, h
@@ -321,7 +321,7 @@ if __name__ == "__main__":
 
         # 9) iteration_s under its raw key; absent or negative -> row omitted
         it_row = next(l for l in frame(cur) if "iteration_s:" in l)
-        assert "20ms" in it_row and "per decode round" not in it_row, it_row
+        assert it_row.rstrip() == "│ iteration_s: 20ms", it_row
         zero = dict(cur, **{"iteration_s": 0.0})
         assert "0ms" in next(l for l in frame(zero) if "iteration_s:" in l)
         no_it = dict(cur)
@@ -336,6 +336,7 @@ if __name__ == "__main__":
         spike = deque((cur["t"] - (300 - i) * 1.0, 0.0 if i < 299 else 1000.0, 0.0)
                       for i in range(300))
         srow = next(l for l in frame(cur, rate_hist=spike, width=60) if "PP 120s" in l)
+        assert len(spike) == 300, len(spike)   # the redraw's own sample was dropped
         assert len(srow) == 60 and srow.endswith("█]"), srow
 
         # 11) pruning follows the sample clock, and a backwards clock resets

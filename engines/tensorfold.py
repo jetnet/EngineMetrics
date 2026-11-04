@@ -205,8 +205,8 @@ def sample(host, port):
         mix = {k: _opt_num(mix_raw.get(k)) for k in MIX_FIELDS}
     reuse["mix"] = mix
     s["reuse"] = reuse
-    # engine-reported decode iteration time (seconds). This field has no published
-    # HELP text, so it is displayed as-is and treated as informational.
+    # engine-reported "iteration_s": the unit is taken from the _s suffix, the
+    # meaning is unpublished, so it is shown under its own key, informational only
     s["iteration_s"] = _opt_num(health.get("iteration_s"))
     live = health.get("live")
     s["live"] = live if isinstance(live, dict) else {}

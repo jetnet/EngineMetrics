@@ -131,11 +131,11 @@ delta-samples between polls:
   ratio exceeds 3, so the row is named after what it measures rather than after a
   depth setting. `rounds_total` of 0 (fresh engine, or a server that reports no
   rounds at all) renders `n/a`.
-- **`iteration_s`** = the engine's own field, rendered as-is with `format_latency`
-  and labelled with the raw key name. It carries no published HELP text, so no
-  averaging window is claimed and nothing is said about what one iteration is. A
-  reported `0` renders `0ms` (data, not a gap); the row is omitted when the field
-  is absent or negative.
+- **`iteration_s`** = the engine's own field, shown under its raw key. The unit is
+  assumed to be seconds from the `_s` suffix and the value is formatted with
+  `format_latency`; no averaging window is claimed and nothing is said about what
+  one iteration covers. A reported `0` renders `0ms` (data, not a gap); the row is
+  omitted when the value is absent, negative, or not a finite number.
 - **SSD spill tier** (patch 0088's disk cache, `/health` → `spill`; engines
   without it keep the old single-column panel): `Stored` is `stored_bytes`,
   `Written`/`Loaded` are cumulative `written_bytes`/`loaded_bytes` with
