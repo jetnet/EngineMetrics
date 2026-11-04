@@ -14,7 +14,7 @@ from .common import (
     COLOR_VALUE, COLOR_WARN, append_rate_sample, avg_wall_rate, draw_bar_row, draw_box_end,
     draw_box_start, draw_row, fetch_json, fetch_metrics_labeled, format_bytes,
     format_latency, format_num, format_speed, format_uptime, get_value, http_get,
-    percentile_from_buckets, sparkline_fit, wall_rate,
+    percentile_from_buckets, quantile_strs, sparkline_fit, wall_rate,
 )
 
 MLX_KEYS = [
@@ -71,28 +71,38 @@ HISTOGRAMS = [
 ]
 
 
-def _pcts(cur, base, total, fmt=None):
-    """p50/p90/p99 from cumulative buckets, as display strings.
+def _num(v):
+    """A finite number from /props, or None.
 
-    '~x' is an interpolated estimate, '>x' means the quantile falls past the last
-    finite bucket so only a lower bound is knowable (the engine's coarsest bucket
-    can be exceeded by every request), and an em dash means no buckets or nothing
-    finished yet. Never claims exactness it does not have.
+    Booleans, strings and junk become None so the panel can print n/a instead of
+    inventing a value; /props is unversioned and nothing guarantees number types.
     """
-    fmt = fmt or format_latency
-    buckets = (cur.get("buckets") or {}).get(base) or {}
-    finite = sorted((u, c) for u, c in buckets.items() if u != float("inf"))
-    out = []
-    for q in (0.5, 0.9, 0.99):
-        if total <= 0 or not finite:
-            out.append("—")
-            continue
-        if q * total > finite[-1][1]:
-            out.append(">" + fmt(finite[-1][0]))
-            continue
-        v = percentile_from_buckets(buckets, total, q)
-        out.append("—" if v is None else "~" + fmt(v))
-    return out
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return v
+
+
+def _section(props, key):
+    """One /props sub-object, or {} when it is absent or not a mapping."""
+    v = props.get(key) if isinstance(props, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def _n(src, key):
+    v = _num(src.get(key))
+    return "n/a" if v is None else format_num(v)
+
+
+def _b(src, key):
+    v = _num(src.get(key))
+    return "n/a" if v is None else format_bytes(v) + "B"
+
+
+def _pcts(cur, base, total, fmt=None):
+    """p50/p90/p99 for one histogram; the honesty markers live in common."""
+    return quantile_strs((cur.get("buckets") or {}).get(base) or {}, total, fmt)
 
 
 def mlx_model_info(host, port):
@@ -124,39 +134,60 @@ def sample(host, port):
     s = {"t": time.time(), "_error": metrics.get("_error")}
     for k in MLX_KEYS:
         s[k] = get_value(metrics, k)
-    # cumulative histogram buckets -> p50/p90/p99 (avoids the average-only view)
+    # Which counters the engine actually published. get_value defaults to 0.0, so
+    # without this a metric that is simply absent would render as a real zero.
+    s["present"] = set(metrics)
+    # cumulative histogram buckets -> p50/p90/p99 (avoids the average-only view).
+    # A repeated `le` means several label sets share this name, and fetch_metrics
+    # keeps only the last value per name, so mixing them would silently misreport.
+    # Drop that histogram entirely instead.
     s["buckets"] = {}
     for base in HISTOGRAMS:
-        b = {}
+        b, dup = {}, False
         for labels, v in series.get(base + "_bucket", []):
             try:
-                b[float(labels.get("le"))] = float(v)
+                le = float(labels.get("le"))
             except (TypeError, ValueError):
                 continue
-        s["buckets"][base] = b
+            if le in b:
+                dup = True
+                break
+            b[le] = float(v)
+        s["buckets"][base] = {} if dup else b
     # /props carries memory, batching and engine settings the metrics lack
     s["props"] = fetch_json(host, port, "/props") if not s["_error"] else None
-    # fetch_metrics keeps only the last label set per name; decode_serial_total is
-    # emitted per-reason, so re-scan the raw text for the full breakdown
+    # decode_serial_total is emitted per reason; the labelled series already has
+    # them all, so a second /metrics scrape is not needed
     s["decode_serial"] = {}
-    if not s["_error"]:
-        try:
-            text = http_get(f"http://{host}:{port}/metrics")
-            for mm in re.finditer(r'^mlx_serve:decode_serial_total\{reason="([^"]+)"\}\s+([\d.eE+-]+)$', text, re.M):
-                s["decode_serial"][mm.group(1)] = float(mm.group(2))
-        except Exception:
-            pass
+    for labels, v in series.get("mlx_serve:decode_serial_total", []):
+        reason = labels.get("reason")
+        if reason is not None:
+            s["decode_serial"][reason] = v
     s["model"] = mlx_model_info(host, port)
     return s
 
 
 def tick(stdscr, args, state):
     cur = sample(args.host, args.port)
+    prev = state["prev"]
+    cur["restarted"] = False
     if not cur.get("_error"):
-        state["history"].append(cur)
-    draw(stdscr, cur, state["prev"], state["history"], state["start_time"],
+        # A restart is a real change in the engine start time. A missing metric
+        # reads as 0.0, which is not a restart, and small jitter is tolerated.
+        a = _num(prev.get("mlx_serve:process_start_time_seconds")) if prev else None
+        b = _num(cur.get("mlx_serve:process_start_time_seconds"))
+        if a and b and abs(b - a) > 1.0:
+            cur["restarted"] = True
+            # counters restart from zero, so the windows must not straddle it
+            state["history"].clear()
+            state["history"].append(cur)
+            if state.get("rate_hist") is not None:
+                state["rate_hist"].clear()
+        else:
+            state["history"].append(cur)
+    draw(stdscr, cur, prev, state["history"], state["start_time"],
          args.host, args.port, args.interval, state["rate_hist"])
-    state["prev"] = cur if not cur.get("_error") else state["prev"]
+    state["prev"] = cur if not cur.get("_error") else prev
 
 
 def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist=None):
@@ -208,7 +239,7 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     mod_id = model.get("id")
     draw_row(stdscr, y, x, "", f"{alias or mod_id or 'unknown'}  ({mstate})", width, value_color=mcolor)
     y += 1
-    if alias and mod_id:
+    if alias and mod_id and alias != mod_id:
         # keep the hash reachable without crowding the readable name
         draw_row(stdscr, y, x, "", f"id {mod_id}", width, value_color=COLOR_DIM)
         y += 1
@@ -375,65 +406,83 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     draw_row(stdscr, y, x, "Serial decode:",
              "  ".join(f"{k} {int(v)}" for k, v in tops) or "none", width)
     y += 1
-    failed = cur["mlx_serve:request_failed_total"]
-    rejected = cur["mlx_serve:request_rejected_total"]
-    started = cur["mlx_serve:process_start_time_seconds"]
-    prev_started = (prev or {}).get("mlx_serve:process_start_time_seconds")
-    restarted = bool(prev_started) and started != prev_started
+    present = cur.get("present") or set()
+    failed = cur["mlx_serve:request_failed_total"] if "mlx_serve:request_failed_total" in present else None
+    rejected = cur["mlx_serve:request_rejected_total"] if "mlx_serve:request_rejected_total" in present else None
+    restarted = bool(cur.get("restarted"))
+    ftxt = f"{int(failed)} failed" if failed is not None else "failed n/a"
+    rtxt = f"{int(rejected)} rejected" if rejected is not None else "rejected n/a"
     draw_row(stdscr, y, x, "Failed / rejected:",
-             f"{int(failed)} failed  {int(rejected)} rejected"
-             + ("   (engine restarted)" if restarted else ""),
+             f"{ftxt}  {rtxt}" + ("   (engine restarted)" if restarted else ""),
              width, value_color=COLOR_RED if (failed or rejected) else COLOR_VALUE)
     y += 1
-    draw_row(stdscr, y, x, "Engine started:",
-             datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S") if started else "n/a",
+    started = (cur["mlx_serve:process_start_time_seconds"]
+               if "mlx_serve:process_start_time_seconds" in present else None)
+    started_txt = "n/a"
+    if started:
+        try:
+            started_txt = datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OverflowError, OSError):
+            started_txt = "n/a (unusable timestamp)"
+    draw_row(stdscr, y, x, "Engine started:", started_txt,
              width, value_color=COLOR_DIM if not started else COLOR_VALUE)
     y += 1
+    ane_seen = ("mlx_serve:ane_layers" in present) or ("mlx_serve:ane_int8_bytes" in present)
     ane_layers = cur["mlx_serve:ane_layers"]
     ane_bytes = cur["mlx_serve:ane_int8_bytes"]
-    draw_row(stdscr, y, x, "ANE prefill:",
-             (f"{int(ane_layers)} layers  {format_bytes(ane_bytes)}B"
-              if (ane_layers or ane_bytes) else "off"),
-             width, value_color=COLOR_VALUE if (ane_layers or ane_bytes) else COLOR_DIM)
+    if not ane_seen:
+        ane_txt, ane_color = "n/a", COLOR_DIM
+    elif ane_layers or ane_bytes:
+        ane_txt, ane_color = f"{int(ane_layers)} layers  {format_bytes(ane_bytes)}B", COLOR_VALUE
+    else:
+        ane_txt, ane_color = "off", COLOR_DIM
+    draw_row(stdscr, y, x, "ANE layers / int8 bytes:", ane_txt, width, value_color=ane_color)
     y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
 
     # ---- Memory & engine settings (/props: not in the metrics surface) ----
-    props = cur.get("props") or {}
-    if props:
-        mem = props.get("memory") or {}
-        sets = props.get("settings") or {}
-        bat = props.get("batching") or {}
-        pc = sets.get("prefix_cache") or {}
-        mtp = sets.get("mtp") or {}
-        pld = sets.get("pld") or {}
-        draw_box_start(stdscr, y, x, width, "Memory & settings (/props)")
-        y += 1
-        draw_row(stdscr, y, x, "Memory:",
-                 f"peak {format_bytes(mem.get('peak_bytes') or 0)}B  "
-                 f"weights {format_bytes(mem.get('weights_bytes') or 0)}B  "
-                 f"kv {format_bytes(mem.get('kv_cache_bytes') or 0)}B", width)
-        y += 1
-        draw_row(stdscr, y, x, "Available:",
-                 f"{format_bytes(mem.get('available_bytes') or 0)}B   "
-                 f"max safe ctx {format_num(mem.get('max_safe_context') or 0)}", width)
-        y += 1
-        draw_row(stdscr, y, x, "Engine:",
-                 f"v{sets.get('version') or '?'}  kv_quant {sets.get('kv_quant') or '?'}  "
-                 f"chunk {format_num(sets.get('prefill_chunk') or 0)}  "
-                 f"max_group {bat.get('max_group')}  conc {sets.get('max_concurrent')}", width)
-        y += 1
-        draw_row(stdscr, y, x, "Speculation:",
-                 f"MTP depth {mtp.get('depth')} adaptive {mtp.get('adaptive')}   "
-                 f"PLD draft {pld.get('draft_len')} (key {pld.get('key_len')})", width)
-        y += 1
-        draw_row(stdscr, y, x, "Prefix cache:",
-                 f"ram {format_bytes(pc.get('mem_bytes') or 0)}B  "
-                 f"disk {format_bytes(pc.get('disk_bytes') or 0)}B", width)
-        y += 1
-        draw_box_end(stdscr, y, x, width)
-        y += 1
+    # Every field is type-checked: /props is unversioned, so a section can be a
+    # list or a string, and a missing number must read n/a rather than 0.
+    props = cur.get("props")
+    if isinstance(props, dict) and props:
+        mem = _section(props, "memory")
+        sets = _section(props, "settings")
+        bat = _section(props, "batching")
+        pc = _section(sets, "prefix_cache")
+        mtp = _section(sets, "mtp")
+        pld = _section(sets, "pld")
+        rows = []
+        if mem:
+            rows.append(("Memory:", f"peak {_b(mem, 'peak_bytes')}  "
+                                    f"weights {_b(mem, 'weights_bytes')}  "
+                                    f"kv {_b(mem, 'kv_cache_bytes')}"))
+            rows.append(("Available:", f"{_b(mem, 'available_bytes')}   "
+                                       f"max safe ctx {_n(mem, 'max_safe_context')}"))
+        if sets or bat:
+            rows.append(("Engine:", f"v{sets.get('version') or 'n/a'}  "
+                                    f"kv_quant {sets.get('kv_quant') or 'n/a'}  "
+                                    f"chunk {_n(sets, 'prefill_chunk')}  "
+                                    f"max_group {_n(bat, 'max_group')}  "
+                                    f"conc {_n(sets, 'max_concurrent')}"))
+        if mtp or pld:
+            ad = mtp.get("adaptive")
+            rows.append(("Speculation:", f"MTP depth {_n(mtp, 'depth')}  "
+                                         f"adaptive {ad if isinstance(ad, bool) else 'n/a'}   "
+                                         f"PLD draft {_n(pld, 'draft_len')} (key {_n(pld, 'key_len')})"))
+        if pc:
+            # key names are shown as reported: nothing documents whether these
+            # bytes are a limit or a usage, so the label must not claim to know
+            rows.append(("prefix_cache:", f"mem_bytes {_b(pc, 'mem_bytes')}  "
+                                          f"disk_bytes {_b(pc, 'disk_bytes')}"))
+        if rows:
+            draw_box_start(stdscr, y, x, width, "Memory & settings (/props)")
+            y += 1
+            for label, value in rows:
+                draw_row(stdscr, y, x, label, value, width)
+                y += 1
+            draw_box_end(stdscr, y, x, width)
+            y += 1
 
     try:
         stdscr.addstr(y, x, "─" * width, curses.color_pair(COLOR_BORDER))

@@ -66,30 +66,19 @@ if __name__ == "__main__":
         render("mlx-serve live :%d" % port, lambda scr: mlx_serve.draw(
             scr, cur, None, [cur], time.time() - 60, host, port, 2, rate_hist=None))
     elif which == "mlx-robust":
-        # asserts instead of printing a frame: alias fallback, the '>' lower-bound
-        # marker, failure/restart/ANE rows and the /props panel, driven through
-        # sample() with patched fetchers (no network)
-        FLAT = {k: 0.0 for k in mlx_serve.MLX_KEYS}
-        FLAT.update({
-            "mlx_serve:request_failed_total": 2.0,
-            "mlx_serve:request_rejected_total": 1.0,
-            "mlx_serve:process_start_time_seconds": 1700000000.0,
-            "mlx_serve:ane_layers": 0.0,
-            "mlx_serve:ane_int8_bytes": 0.0,
-            "vllm:request_prompt_tokens_sum": 1000.0,
-            "vllm:request_prompt_tokens_count": 9.0,
-            "vllm:request_generation_tokens_sum": 450.0,
-            "vllm:request_generation_tokens_count": 9.0,
-            "vllm:e2e_request_latency_seconds_count": 9.0,
-            "vllm:time_to_first_token_seconds_count": 9.0,
-            "vllm:request_prefill_time_seconds_count": 9.0,
-            "vllm:request_decode_time_seconds_count": 9.0,
-        })
-        # last finite bucket holds only 4 of 9 observations -> quantiles are bounds
-        SERIES = {base + "_bucket": [
-            ({"le": "1"}, 2.0), ({"le": "5"}, 4.0),
-            ({"le": "10"}, 4.0), ({"le": "+Inf"}, 9.0),
-        ] for base in mlx_serve.HISTOGRAMS}
+        # Asserts instead of printing. common.http_get is patched rather than
+        # fetch_metrics_labeled, so the real /metrics bucket parse runs: a stub
+        # fetcher would hide a broken keep_buckets path.
+        import json as _json
+        import engines.common as _common
+
+        def hist(base, rows, total, summ):
+            out = ['# TYPE %s histogram' % base]
+            out += ['%s_bucket{le="%s"} %s' % (base, le, c) for le, c in rows]
+            out += ['%s_sum %s' % (base, summ), '%s_count %s' % (base, total)]
+            return out
+
+        START = [1700000000.0]
         PROPS = {
             "memory": {"peak_bytes": 8 * 2 ** 30, "weights_bytes": 4 * 2 ** 30,
                        "kv_cache_bytes": 2 ** 30, "available_bytes": 3 * 2 ** 30,
@@ -103,41 +92,134 @@ if __name__ == "__main__":
         MODELS = {"data": [{"id": "abc123", "alias": "Pretty-Name", "loaded": True,
                             "context_length": 1000, "bytes_resident": 2 ** 30,
                             "meta": {"architecture": "arch", "quantization": "4-bit"}}]}
-        mlx_serve.fetch_metrics_labeled = lambda h, p, keep_buckets=False: (FLAT, SERIES, None)
-        mlx_serve.fetch_json = lambda h, p, path: PROPS if path == "/props" else MODELS
-        mlx_serve.http_get = lambda url, timeout=5: ""     # no serial-decode reasons
+
+        def metrics_text():
+            out = []
+            # e2e keeps 4 of 6 inside its last finite bucket: p50 interpolates,
+            # p90/p99 fall past it and must be shown as lower bounds
+            out += hist("vllm:e2e_request_latency_seconds",
+                        [("1", 0), ("5", 2), ("10", 4), ("+Inf", 6)], 6, 30)
+            # ttft is fully observable: no bound may appear on this row
+            out += hist("vllm:time_to_first_token_seconds",
+                        [("1", 1), ("2.5", 3), ("5", 7), ("+Inf", 7)], 7, 14)
+            out += hist("vllm:request_prefill_time_seconds",
+                        [("2", 1), ("4", 4), ("8", 8), ("+Inf", 8)], 8, 32)
+            out += hist("vllm:request_decode_time_seconds",
+                        [("3", 2), ("6", 6), ("12", 9), ("+Inf", 9)], 9, 54)
+            # 0.9 * 10 == 9 == the last finite count: '>' must stay strict
+            out += hist("vllm:request_prompt_tokens", [("100", 9), ("+Inf", 10)], 10, 500)
+            out += hist("vllm:request_generation_tokens", [("10", 11), ("+Inf", 11)], 11, 110)
+            out += [
+                "vllm:prompt_tokens_total 1234",
+                "vllm:generation_tokens_total 567",
+                "vllm:request_success_total 6",
+                "vllm:request_cancelled_total 0",
+                "vllm:num_requests_running 0",
+                "vllm:num_requests_waiting 0",
+                "vllm:prefix_cache_hits_total 0",
+                "vllm:prefix_cache_queries_total 0",
+                "mlx_serve:prefill_tokens_total 100",
+                "mlx_serve:request_failed_total 2",
+                "mlx_serve:request_rejected_total 1",
+                "mlx_serve:process_start_time_seconds %.1f" % START[0],
+                "mlx_serve:ane_layers 12",
+                "mlx_serve:ane_int8_bytes 1073741824",
+                'mlx_serve:decode_serial_total{reason="grammar"} 3',
+                'mlx_serve:decode_serial_total{reason="stop"} 5',
+            ]
+            return "\n".join(out) + "\n"
+
+        body = {"metrics": metrics_text(), "props": _json.dumps(PROPS)}
+        urls = []
+
+        def fake_http(url, timeout=5):
+            urls.append(url)
+            if url.endswith("/metrics"):
+                m = body["metrics"]
+                return m() if callable(m) else m
+            if url.endswith("/props"):
+                return body["props"]
+            if url.endswith("/v1/models"):
+                return _json.dumps(MODELS)
+            raise AssertionError("unexpected request: " + url)
+
+        _common.http_get = fake_http
+
+        class Args:
+            host, port, interval = "h", 1, 2
 
         cur = mlx_serve.sample("h", 1)
-        assert cur["buckets"]["vllm:e2e_request_latency_seconds"][float("inf")] == 9.0
-        assert cur["props"]["settings"]["mtp"]["depth"] == 6, cur["props"]
-        assert cur["mlx_serve:request_failed_total"] == 2.0, cur
+        assert 10.0 in cur["buckets"]["vllm:e2e_request_latency_seconds"], cur["buckets"]
+        assert cur["decode_serial"] == {"grammar": 3.0, "stop": 5.0}, cur["decode_serial"]
+        assert "mlx_serve:request_failed_total" in cur["present"]
+        assert sum(u.endswith("/metrics") for u in urls) == 1, urls
 
-        def mlx_frame(c):
+        def frame(c):
             scr = FakeScr(120)
             mlx_serve.draw(scr, c, None, [c], time.time() - 60, "h", 1, 2, rate_hist=None)
             return scr.buf
 
-        rows = mlx_frame(cur)
+        rows = frame(cur)
         joined = "\n".join(rows)
         assert "Pretty-Name" in joined and "id abc123" in joined, joined[:400]
-        lat = next(l for l in rows if "E2E latency:" in l)
-        assert ">10.00s" in lat and "~" not in lat, lat     # bound, not fake 10.00s
+        e2e = next(l for l in rows if "E2E latency:" in l)
+        assert "p50 ~" in e2e and "p90 >10.00s" in e2e and "(n=6)" in e2e, e2e
+        ttft = next(l for l in rows if l.startswith("│ TTFT:"))
+        assert ">" not in ttft and "(n=7)" in ttft, ttft
+        prompt = next(l for l in rows if "Prompt tokens:" in l)
+        assert "p90 ~100" in prompt and "p99 >100" in prompt and "(n=10)" in prompt, prompt
+        gen = next(l for l in rows if "Output tokens:" in l)
+        assert "(n=11)" in gen and "avg 10" in gen, gen
         tot = next(l for l in rows if "Failed / rejected:" in l)
         assert "2 failed" in tot and "1 rejected" in tot, tot
-        assert "off" in next(l for l in rows if "ANE prefill:" in l)
-        assert "max safe ctx 96.5K" in next(l for l in rows if "Available:" in l)
+        assert "12 layers" in next(l for l in rows if "ANE layers" in l)
         assert "MTP depth 6" in joined and "PLD draft 5" in joined, joined
-        assert "Engine started:" in joined, joined
+        assert "max safe ctx 96.5K" in next(l for l in rows if "Available:" in l)
 
-        # no /props -> panel hidden; entry without alias -> readable id, no dup line
-        mlx_serve.fetch_json = lambda h, p, path: (
-            None if path == "/props"
-            else {"data": [{"id": "readable/id", "loaded": False, "meta": {}}]})
-        cur2 = mlx_serve.sample("h", 1)
-        rows2 = mlx_frame(cur2)
-        assert not any("Memory & settings" in l for l in rows2), "props panel must hide"
-        assert "readable/id" in "\n".join(rows2), "alias-less entry must show its id"
-        assert not any("id readable/id" in l for l in rows2), "no duplicate id line"
+        # A counter the engine does not publish must read n/a, never a fake 0.
+        body["metrics"] = "\n".join(
+            l for l in metrics_text().splitlines()
+            if not l.startswith(("mlx_serve:request_failed_total",
+                                 "mlx_serve:request_rejected_total",
+                                 "mlx_serve:ane_",
+                                 "mlx_serve:process_start_time_seconds")))
+        rows = frame(mlx_serve.sample("h", 1))
+        tot = next(l for l in rows if "Failed / rejected:" in l)
+        assert "n/a" in tot and "0 failed" not in tot, tot
+        assert "n/a" in next(l for l in rows if "Engine started:" in l)
+        assert "n/a" in next(l for l in rows if "ANE layers" in l)
+
+        # /props that is not an object, or holds junk, must not crash the TUI.
+        body["props"] = _json.dumps([1, 2, 3])
+        rows = frame(mlx_serve.sample("h", 1))
+        assert not any("Memory & settings" in l for l in rows), "panel must hide"
+        body["props"] = _json.dumps({"settings": {"mtp": True, "prefix_cache": ["x"]}})
+        rows = frame(mlx_serve.sample("h", 1))
+        assert any("Engine:" in l for l in rows), rows
+
+        # Restart detection lives in tick(): tolerance, and both windows reset.
+        body["metrics"] = metrics_text      # callable: each request re-reads START
+        body["props"] = _json.dumps(PROPS)
+        state = {"history": [], "prev": None, "start_time": time.time() - 30,
+                 "rate_hist": []}
+        mlx_serve.tick(FakeScr(120), Args, state)
+        assert state["prev"]["restarted"] is False, state["prev"]
+        START[0] += 0.5                       # jitter is not a restart
+        mlx_serve.tick(FakeScr(120), Args, state)
+        assert state["prev"]["restarted"] is False, state["prev"]
+        assert len(state["history"]) == 2, state["history"]
+        START[0] += 100                       # the engine really restarted
+        mlx_serve.tick(FakeScr(120), Args, state)
+        assert state["prev"]["restarted"] is True, state["prev"]
+        assert len(state["history"]) == 1, "history must not straddle a restart"
+        # draw() re-appends one sample after the clear, so exactly one remains:
+        # the pre-restart samples must be gone
+        assert len(state["rate_hist"]) == 1, state["rate_hist"]
+
+        # alias == id must not print the same string twice
+        MODELS["data"][0]["alias"] = MODELS["data"][0]["id"]
+        rows = frame(mlx_serve.sample("h", 1))
+        assert sum(1 for l in rows if "abc123" in l) == 1, rows
         print("mlx robust: OK")
     elif which in ("tensorfold", "tensorfold-synthetic"):
         import engines.tensorfold as tf

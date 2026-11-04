@@ -208,6 +208,29 @@ def format_latency(seconds):
     return f"{seconds * 1000:.0f}ms"
 
 
+def quantile_strs(buckets, total, fmt=None, qs=(0.5, 0.9, 0.99)):
+    """p50/p90/p99 as display strings for one cumulative histogram.
+
+    '>x' when the quantile falls past the last finite bucket: the tail is not
+    observable there, so the bound must not be presented as a measurement.
+    '~x' otherwise, because the value is interpolated inside a coarse bucket.
+    An em dash means no histogram or nothing has finished yet.
+    """
+    fmt = fmt or format_latency
+    finite = sorted((u, c) for u, c in (buckets or {}).items() if u != float("inf"))
+    out = []
+    for q in qs:
+        if total <= 0 or not finite:
+            out.append("—")
+            continue
+        if q * total > finite[-1][1]:
+            out.append(">" + fmt(finite[-1][0]))
+            continue
+        v = percentile_from_buckets(buckets, total, q)
+        out.append("—" if v is None else "~" + fmt(v))
+    return out
+
+
 # ---------------- box/row drawing ----------------
 
 def draw_box_start(stdscr, y, x, width, title, color=COLOR_BORDER):
