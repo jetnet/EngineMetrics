@@ -1,6 +1,8 @@
 """Headless render test: one clean frame per engine backend (live where reachable).
 
-Usage: python3 tests/render_test.py [omlx|mlx-serve|vllm|splash|splash-synthetic] [host [port]]
+Usage: python3 tests/render_test.py [omlx|mlx-serve|vllm|vllm-synthetic|tensorfold|
+         tensorfold-synthetic|tensorfold-robust|splash|splash-synthetic|splash-robust]
+         [host [port]]
 """
 import os
 import sys
@@ -89,7 +91,9 @@ if __name__ == "__main__":
                  "spill_disk_free_bytes": 1697770065920.0,
                  "tensorfold:requests_running": 1.0, "tensorfold:requests_waiting": 0.0,
                  "tensorfold:kv_cache_usage_ratio": 0.0,
-                 "tensorfold:request_latency_seconds_sum": 5998.0,
+                 # must lie inside what the buckets allow ([1565, 3530]); the old
+                 # 5998 made avg(10.20s) exceed p90(8.60s), which cannot happen
+                 "tensorfold:request_latency_seconds_sum": 2400.0,
                  "tensorfold:request_latency_seconds_count": 588.0,
                  "tensorfold:time_to_first_token_seconds_sum": 1087.0,
                  "tensorfold:time_to_first_token_seconds_count": 588.0,
@@ -124,6 +128,77 @@ if __name__ == "__main__":
             render("tensorfold synthetic", lambda scr: tf.draw(
                 scr, b, a, [a, b], time.time() - 60, "localhost", 8100, 2, "glm-5.3-flash",
                 rate_hist=None, spill_hist=hist, spill_cap=128.0))
+    elif which == "tensorfold-robust":
+        # Asserts instead of printing a frame: the histogram parse path, the
+        # percentile maths and the honest-gap rendering must be covered, else a
+        # broken percentile would still "render fine".
+        import json as _json
+        import engines.common as _common
+        import engines.tensorfold as tf
+        from engines.common import percentile_from_buckets
+
+        METRICS = "\n".join(
+            ["# HELP tensorfold:request_latency_seconds Seconds from arrival to the reply leaving.",
+             "# TYPE tensorfold:request_latency_seconds histogram"]
+            + [f'tensorfold:request_latency_seconds_bucket{{le="{le}"}} {c}'
+               for le, c in (("1", 100), ("2.5", 300), ("5", 450), ("10", 560),
+                             ("30", 580), ("60", 588), ("+Inf", 588))]
+            + ["tensorfold:request_latency_seconds_sum 2400",
+               "tensorfold:request_latency_seconds_count 588",
+               "# TYPE tensorfold:time_to_first_token_seconds histogram",
+               'tensorfold:time_to_first_token_seconds_bucket{le="0.5"} 50',
+               'tensorfold:time_to_first_token_seconds_bucket{le="1"} 200',
+               'tensorfold:time_to_first_token_seconds_bucket{le="2.5"} 470',
+               'tensorfold:time_to_first_token_seconds_bucket{le="5"} 560',
+               'tensorfold:time_to_first_token_seconds_bucket{le="10"} 585',
+               'tensorfold:time_to_first_token_seconds_bucket{le="+Inf"} 588',
+               "tensorfold:time_to_first_token_seconds_sum 1087",
+               "tensorfold:time_to_first_token_seconds_count 588",
+               "tensorfold:requests_running 0", "tensorfold:requests_waiting 0",
+               "tensorfold:prompt_tokens_total 1000",
+               "tensorfold:generation_tokens_total 500"])
+        HEALTH = {"ok": True, "backend": "tensorfold", "busy": False}
+        # fetch_metrics_labeled() and fetch_json() both read through http_get()
+        _common.http_get = lambda url, timeout=5: (
+            METRICS if url.endswith("/metrics") else _json.dumps(HEALTH))
+
+        cur = tf.sample("localhost", 8100)
+        buckets = cur["lat_buckets"]
+        # 1) the real parse path kept every bucket, including the +Inf bound
+        assert sorted(buckets) == [1.0, 2.5, 5.0, 10.0, 30.0, 60.0, float("inf")], buckets
+        assert buckets[float("inf")] == 588.0, buckets
+        assert tf._buckets({}, "x") == {}, "absent histogram must yield {}"
+
+        # 2) the maths, checked against the algorithm, not against a string
+        count = cur["tensorfold:request_latency_seconds_count"]
+        for q, want in ((0.5, 2.455), (0.9, 8.6), (0.99, 37.95)):
+            got = percentile_from_buckets(buckets, count, q)
+            assert abs(got - want) < 1e-6, (q, got, want)
+
+        # 3) estimates are marked; an unobservable tail claims no exactness
+        strs = tf._quantile_strs(buckets, count)
+        assert strs[0].startswith("~") and strs[2] == "~37.95s", strs
+        assert tf._quantile_strs({1.0: 5.0, 60.0: 10.0}, 20.0)[2] == ">60.00s"
+
+        # 4) honest gaps: nothing finished, or the server exposes no buckets
+        assert tf._quantile_strs(buckets, 0.0) == ["—", "—", "—"]
+        assert tf._quantile_strs({}, 588.0) == ["—", "—", "—"]
+
+        def frame(c):
+            scr = FakeScr()
+            tf.draw(scr, c, None, [c], time.time() - 60, "localhost", 8100, 2, "m",
+                    rate_hist=None)
+            return scr.buf
+
+        lat_row = next(l for l in frame(cur) if "Latency:" in l)
+        assert "p99 ~37.95s" in lat_row and "(n=588)" in lat_row, lat_row
+
+        idle = dict(cur, **{"tensorfold:request_latency_seconds_count": 0.0,
+                            "tensorfold:time_to_first_token_seconds_count": 0.0,
+                            "lat_buckets": {}, "ttft_buckets": {}})
+        idle_row = next(l for l in frame(idle) if "Latency:" in l)
+        assert "avg —" in idle_row and "p50 —" in idle_row and "(n=0)" in idle_row, idle_row
+        print("tensorfold robust: OK")
     elif which == "splash":
         # live: two samples apart against the engine, then render with deltas
         host = sys.argv[2] if len(sys.argv) > 2 else "localhost"

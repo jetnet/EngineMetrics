@@ -21,6 +21,8 @@ from .common import (
     draw_box_end, draw_box_start, draw_row, fetch_metrics_labeled,
     format_num, format_speed, format_uptime, percentile_from_buckets,
     prune_rate_hist, sparkline, wall_rate,
+    # one shared ms/s formatter for latency percentiles (was a private copy here)
+    format_latency as _fmt_ms,
 )
 
 COUNTERS = [
@@ -147,14 +149,6 @@ def _pct_delta(cur, prev, hist, q):
         except ValueError:
             continue
     return percentile_from_buckets(pts, total, q)
-
-
-def _fmt_ms(seconds):
-    if seconds is None:
-        return "—"
-    if seconds >= 1.0:
-        return f"{seconds:.2f}s"
-    return f"{seconds * 1000:.0f}ms"
 
 
 def tick(stdscr, args, state):

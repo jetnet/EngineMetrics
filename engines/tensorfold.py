@@ -56,21 +56,48 @@ def _num(v):
 
 
 def _buckets(series, base):
-    """{upper_bound: cumulative_count} for one histogram, '+Inf' dropped by the
-    caller's percentile helper. Absent server-side (no keep_buckets scrape) -> {}."""
+    """{upper_bound: cumulative_count} for one histogram. The '+Inf' bound is
+    kept as float('inf') and dropped later by the percentile helper. A server
+    that exposes no buckets (slim /metrics, older build) yields {}.
+
+    ASSUMPTION: one label set per histogram. Verified against the live engine
+    (jetspark01:8045): the only label is `le`; buckets are cumulative and the
+    '+Inf' bucket equals `_count`. With several label sets the last one would
+    win, so a multi-tenant server would need summing here and in the count.
+    """
     out = {}
     for labels, v in series.get(base + "_bucket", []):
         try:
-            out[float(labels.get("le"))] = _num(v)
+            bound, count = float(labels.get("le")), float(v)
         except (TypeError, ValueError):
             continue
+        if count != count or abs(count) == float("inf"):
+            continue    # NaN/Inf count: unusable bucket, better skipped than 0
+        out[bound] = count
     return out
 
 
-def _quantiles(buckets, total, qs=(0.5, 0.9, 0.99)):
-    """Estimated percentiles from cumulative buckets; None where the server
-    exposes no histogram (draw() then renders an em dash)."""
-    return [percentile_from_buckets(buckets or {}, total, q) for q in qs]
+def _quantile_strs(buckets, total, qs=(0.5, 0.9, 0.99)):
+    """p50/p90/p99 as display strings, or em dashes when the server exposes no
+    histogram or nothing has finished yet.
+
+    '>x' when the quantile falls past the last finite bucket: the tail is not
+    observable there, so claiming the bound as exact would be a lie. '~x'
+    otherwise, because the value is interpolated inside a coarse bucket rather
+    than measured.
+    """
+    finite = sorted((u, c) for u, c in (buckets or {}).items() if u != float("inf"))
+    out = []
+    for q in qs:
+        if total <= 0 or not finite:
+            out.append("—")
+            continue
+        if q * total > finite[-1][1]:
+            out.append(f">{format_latency(finite[-1][0])}")
+            continue
+        v = percentile_from_buckets(buckets, total, q)
+        out.append("—" if v is None else f"~{format_latency(v)}")
+    return out
 
 
 # /health "spill" dict (patch 0088 disk tier) — flattened as spill_<field> so
@@ -364,8 +391,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     lat_n = cur["tensorfold:request_latency_seconds_count"]
     ttft_sum = cur["tensorfold:time_to_first_token_seconds_sum"]
     ttft_n = cur["tensorfold:time_to_first_token_seconds_count"]
-    avg_lat = lat_sum / lat_n if lat_n else 0.0
-    avg_ttft = ttft_sum / ttft_n if ttft_n else 0.0
+    avg_lat = lat_sum / lat_n if lat_n else None
+    avg_ttft = ttft_sum / ttft_n if ttft_n else None
     drafted = cur["drafted_total"]
     accepted = cur["accepted_total"]
     acc_rate = accepted / drafted * 100 if drafted else 0.0
@@ -374,17 +401,17 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     hit = ctok / ptok * 100 if ptok else 0.0
     cache_known = cur.get("cache_known", True)
 
-    draw_box_start(stdscr, y, x, width, "Averages (cumulative)")
+    draw_box_start(stdscr, y, x, width, "Latency (cumulative)")
     y += 1
-    lat_q = _quantiles(cur.get("lat_buckets"), lat_n)
-    ttft_q = _quantiles(cur.get("ttft_buckets"), ttft_n)
+    lat_q = _quantile_strs(cur.get("lat_buckets"), lat_n)
+    ttft_q = _quantile_strs(cur.get("ttft_buckets"), ttft_n)
     draw_row(stdscr, y, x, "Latency:",
-             f"avg {format_latency(avg_lat)}   p50 {format_latency(lat_q[0])}  "
-             f"p90 {format_latency(lat_q[1])}  p99 {format_latency(lat_q[2])}  (n={int(lat_n)})", width)
+             f"avg {format_latency(avg_lat)}   p50 {lat_q[0]}  "
+             f"p90 {lat_q[1]}  p99 {lat_q[2]}  (n={int(lat_n)})", width)
     y += 1
     draw_row(stdscr, y, x, "TTFT:",
-             f"avg {format_latency(avg_ttft)}   p50 {format_latency(ttft_q[0])}  "
-             f"p90 {format_latency(ttft_q[1])}  p99 {format_latency(ttft_q[2])}  (n={int(ttft_n)})", width)
+             f"avg {format_latency(avg_ttft)}   p50 {ttft_q[0]}  "
+             f"p90 {ttft_q[1]}  p99 {ttft_q[2]}  (n={int(ttft_n)})", width)
     y += 1
     acc_color = COLOR_GREEN if acc_rate >= 70 else COLOR_WARN if acc_rate >= 50 else COLOR_RED
     if not drafted:
