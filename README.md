@@ -79,7 +79,7 @@ exporter, no dependencies.
 | Backend | Detection | What you get |
 |---|---|---|
 | **vLLM** | `vllm:*` keys in `/metrics` | Live PP/TG (engine-time + wall-clock, delta-sampled), 120s sparklines, batch shape (tokens/step), KV occupancy + pool tokens, prefix-cache hit rates (live + cumulative), MTP/spec acceptance with τ and per-position decay, ITL/TTFT/E2E/queue latency with p50/p90/p99 percentiles, preemption warnings, finish-reason accounting, scheduler fairness gauges, tool-call traffic profile, model card from `cache_config_info` |
-| **TensorFold** | `backend: "tensorfold"` in `/health` | Live PP/TG (engine-time + wall-clock), 120s sparklines, stream states, shared-pool occupancy, kept prompts, MTP acceptance, TTFT/latency averages plus p50/p90/p99 interpolated from the `/metrics` histogram buckets (`~` = estimate inside a coarse bucket, `>` = tail beyond the last finite bucket), cache-hit %, multi-prefill stats, cache-reuse panel (kept bytes/mix, prefix waits, continued chats), SSD spill tier panel (stored/written/loaded/restored, fill bar via `--spill-cap`, restore p50/p95, failures, 120s restore sparkline) |
+| **TensorFold** | `backend: "tensorfold"` in `/health` | Live PP/TG (engine-time + wall-clock), 120s sparklines, stream states, shared-pool occupancy, kept prompts, MTP acceptance + drafted/kept per decode round, TTFT/latency averages plus p50/p90/p99 interpolated from the `/metrics` histogram buckets (`~` = estimate inside a coarse bucket, `>` = tail beyond the last finite bucket), cache-hit %, engine-reported decode iteration time, multi-prefill stats, cache-reuse panel (kept bytes/mix, prefix waits, continued chats), SSD spill tier panel (stored/written/loaded/restored, fill bar via `--spill-cap`, restore p50/p95, failures, 120s restore sparkline) |
 | **mlx-serve** | `mlx_serve:*` keys in `/metrics` (checked before `vllm:*` — mlx-serve emits both) | Live TG/PP (wall-clock, from `*_live` gauges that include in-flight slots), in-flight prefill progress bar, GPU util + memory footprint, model card (arch/quant/ctx/MTP/resident), 120s sparklines, prefix-cache hit rates, TTFT/latency averages, serial-decode reasons |
 | **oMLX** | `engine_pool` in `/health` (fallback: `models_discovered` in `/api/status`) | Live TG from per-slot `tokens_per_second` (in-flight), native prefill progress bar with ETA (`processed`/`total`/`speed`), loaded-model cards (engine_type/ctx/size), memory pool + pressure levels, cache efficiency, engine cumulative TPS averages, device info (chip/GPU cores), custom-kernel availability |
 | **Splash** | `splash_*` keys in `/metrics` (dashboard reads the JSON `/status` mirror) | Live PP/TG (engine-time + wall-clock, delta-sampled), 120s sparklines, scheduler streams + decode batch-width mix (b1–b4), admission queue, KV page-pool occupancy + extent stats, prompt-cache hit rate + state store, memory governor + thermal state, TTFT/ITL p50/p95, DFlash2 draft acceptance, last-batch detail, device card (chip/GPU cores/ANE split) |
@@ -124,6 +124,14 @@ delta-samples between polls:
   cache-pool occupancy — plus per-stream `kv_cache_usage_ratio` and `kept_prompts`.
 - **MTP acceptance** = `accepted_total` / `drafted_total` — TensorFold counts
   drafted *tokens* (not rounds), so no vLLM-style ×k multiplier.
+- **MTP depth** = `drafted_total` / `rounds_total` and `accepted_total` /
+  `rounds_total`, i.e. draft tokens verified and kept per decode round (both
+  counters are "of finished requests" per their HELP text). `rounds_total` is 0
+  on a fresh engine, which renders `n/a` instead of dividing by zero.
+- **Iteration (engine)** = the engine's own `iteration_s` field, shown as-is with
+  `format_latency`. It has no published HELP text, so the window it covers is not
+  documented here; on the engine this was built against it reads `0ms` while idle
+  and the row is omitted entirely when the field is absent.
 - **SSD spill tier** (patch 0088's disk cache, `/health` → `spill`; engines
   without it keep the old single-column panel): `Stored` is `stored_bytes`,
   `Written`/`Loaded` are cumulative `written_bytes`/`loaded_bytes` with

@@ -205,6 +205,9 @@ def sample(host, port):
         mix = {k: _opt_num(mix_raw.get(k)) for k in MIX_FIELDS}
     reuse["mix"] = mix
     s["reuse"] = reuse
+    # engine-reported decode iteration time (seconds). This field has no published
+    # HELP text, so it is displayed as-is and treated as informational.
+    s["iteration_s"] = _opt_num(health.get("iteration_s"))
     live = health.get("live")
     s["live"] = live if isinstance(live, dict) else {}
     s["max_batch_size"] = _num(health.get("max_batch_size"))
@@ -320,6 +323,11 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
                  f"running {int(cur['requests_running'])}  waiting {int(cur['requests_waiting'])}  "
                  f"/ max batch {int(cur['max_batch_size'])}", width)
     y += 1
+    it = cur.get("iteration_s")
+    if it is not None:
+        draw_row(stdscr, y, x, "Iteration (engine):",
+                 f"{format_latency(it)} per decode round", width)
+        y += 1
     lv = cur["live"]
     if lv:
         draw_row(stdscr, y, x, "Engine-reported:",
@@ -474,6 +482,17 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     if not drafted:
         acc_color = COLOR_DIM
     draw_row(stdscr, y, x, "MTP Acceptance:", f"{acc_rate:.1f}%  ({format_num(accepted)}/{format_num(drafted)})", width, value_color=acc_color)
+    y += 1
+    rounds = cur["rounds_total"]
+    if rounds > 0:
+        # HELP: drafted/accepted are the draft tokens verified/kept on finished
+        # requests, rounds_total is the decode rounds of finished requests
+        draw_row(stdscr, y, x, "MTP depth:",
+                 f"{drafted / rounds:.2f} drafted/round   {accepted / rounds:.2f} kept/round"
+                 f"   ({int(rounds)} rounds)", width)
+    else:
+        draw_row(stdscr, y, x, "MTP depth:", "n/a (no decode rounds yet)", width,
+                 value_color=COLOR_DIM)
     y += 1
     if cache_known:
         hit_color = COLOR_GREEN if hit >= 70 else COLOR_WARN

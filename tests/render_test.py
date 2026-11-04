@@ -71,6 +71,7 @@ if __name__ == "__main__":
                  "requests_total": 64.0, "requests_running": 1.0, "requests_waiting": 0.0, "prompt_tokens_total": 2284160.0,
                  "completion_tokens_total": 33841.0, "generation_tokens_total": 33841.0, "cached_tokens_total": 990144.0,
                  "rounds_total": 8819.0, "drafted_total": 39069.0, "accepted_total": 16800.0,
+                 "iteration_s": 0.02,
                  "prefill_seconds_total": 47.1, "decode_seconds_total": 538.3,
                  "pool_tokens": 2138112.0, "pool_free_tokens": 1472512.0,
                  "kept_prompts": 32.0, "kept_bytes": 2997771520.0, "context_length": 1048576.0,
@@ -167,7 +168,11 @@ if __name__ == "__main__":
                   "kept_bytes": 3033006080, "kept_bytes_cap": 0,
                   "kept_mix": {"own": 17, "shared": 15, "chats": 11, "rows": 1162688},
                   "prefix_waits": 2, "prefix_wait_tokens": 40960,
-                  "chats_continued": 1, "chats_continued_prefill_tokens": 8192}
+                  "chats_continued": 1, "chats_continued_prefill_tokens": 8192,
+                  # depth/iteration need the engine's own counters: they are not in
+                  # the canned /metrics above, and absent -> 0 would render n/a
+                  "rounds_total": 8819, "drafted_total": 39069, "accepted_total": 16800,
+                  "iteration_s": 0.02}
         # fetch_metrics_labeled() and fetch_json() both read through http_get()
         _common.http_get = lambda url, timeout=5: (
             METRICS if url.endswith("/metrics") else _json.dumps(HEALTH))
@@ -263,7 +268,7 @@ if __name__ == "__main__":
         assert "avg —" in idle_row and "p50 —" in idle_row and "(n=0)" in idle_row, idle_row
         # 7) sparkline window: one point per tick, and it must not grow on a
         #    redraw (the entrypoint re-samples on every key/mouse-wheel event)
-        from engines.common import append_rate_sample, sparkline_fit
+        from engines.common import append_rate_sample, sparkline, sparkline_fit
         # real-ish timestamps: append_rate_sample prunes against wall clock
         base = time.time()
         h = deque()
@@ -298,6 +303,26 @@ if __name__ == "__main__":
         narrow = frame(cur, rate_hist=long_hist, width=60)
         assert max(len(l) for l in narrow) <= 60, max(len(l) for l in narrow)
         assert any("PP 120s" in l for l in narrow), "sparkline row must render"
+
+        # newest samples must survive fitting (string truncation kept the oldest)
+        busiest = [0.0] * 99 + [100.0]
+        tail = sparkline_fit(busiest, 10)
+        assert tail[-1] == "█" and "█" not in tail[:-1], tail
+        assert "█" not in sparkline(busiest[:10]), "oldest-first window would hide it"
+
+        # 8) MTP depth per decode round, from drafted/accepted/rounds counters
+        mtp_row = next(l for l in frame(cur) if "MTP depth:" in l)
+        assert "4.43 drafted/round" in mtp_row and "1.90 kept/round" in mtp_row, mtp_row
+        assert "(8819 rounds)" in mtp_row, mtp_row
+        flat = dict(cur, **{"rounds_total": 0.0})
+        assert "n/a" in next(l for l in frame(flat) if "MTP depth:" in l)
+
+        # 9) engine-reported iteration time: absent -> row omitted, never a fake 0
+        it_row = next(l for l in frame(cur) if "Iteration (engine):" in l)
+        assert "20ms" in it_row, it_row
+        no_it = dict(cur)
+        no_it.pop("iteration_s", None)
+        assert not any("Iteration (engine):" in l for l in frame(no_it))
 
         print("tensorfold robust: OK")
     elif which == "splash":
