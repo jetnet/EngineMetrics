@@ -364,8 +364,8 @@ def sparkline(points):
     return "".join(out)
 
 
-def prune_rate_hist(rate_hist, seconds=120.0):
-    now = time.time()
+def prune_rate_hist(rate_hist, seconds=120.0, now=None):
+    now = time.time() if now is None else now
     while rate_hist and now - rate_hist[0][0] > seconds:
         rate_hist.popleft()
 
@@ -379,10 +379,14 @@ def append_rate_sample(rate_hist, t, *values, min_gap=0.0):
     lengthened on every scroll. Samples less than `min_gap` seconds newer than
     the last one are dropped, then the window is pruned to 120s.
     """
+    if rate_hist and t < rate_hist[-1][0]:
+        rate_hist.clear()       # clock stepped backwards: old points are unusable
     if rate_hist and t - rate_hist[-1][0] < min_gap:
         return False
     rate_hist.append((t,) + values)
-    prune_rate_hist(rate_hist, 120.0)
+    # prune on the sample clock, not wall clock: they agree in production (t is
+    # time.time() from the same tick) but tests can then use fixed timestamps
+    prune_rate_hist(rate_hist, 120.0, now=t)
     return True
 
 

@@ -324,9 +324,10 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
                  f"/ max batch {int(cur['max_batch_size'])}", width)
     y += 1
     it = cur.get("iteration_s")
-    if it is not None:
-        draw_row(stdscr, y, x, "Iteration (engine):",
-                 f"{format_latency(it)} per decode round", width)
+    if it is not None and it >= 0:
+        # shown under its own key name: the field has no published HELP text, so
+        # no averaging window or "per decode round" meaning is claimed
+        draw_row(stdscr, y, x, "iteration_s:", format_latency(it), width)
         y += 1
     lv = cur["live"]
     if lv:
@@ -486,13 +487,14 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     rounds = cur["rounds_total"]
     if rounds > 0:
         # HELP: drafted/accepted are the draft tokens verified/kept on finished
-        # requests, rounds_total is the decode rounds of finished requests
-        draw_row(stdscr, y, x, "MTP depth:",
-                 f"{drafted / rounds:.2f} drafted/round   {accepted / rounds:.2f} kept/round"
+        # requests, rounds_total is the decode rounds of finished requests. This
+        # is a ratio of counters, not the engine's configured MTP depth.
+        draw_row(stdscr, y, x, "Drafted/kept per round:",
+                 f"{drafted / rounds:.2f} drafted   {accepted / rounds:.2f} kept"
                  f"   ({int(rounds)} rounds)", width)
     else:
-        draw_row(stdscr, y, x, "MTP depth:", "n/a (no decode rounds yet)", width,
-                 value_color=COLOR_DIM)
+        draw_row(stdscr, y, x, "Drafted/kept per round:",
+                 "n/a (no decode rounds reported)", width, value_color=COLOR_DIM)
     y += 1
     if cache_known:
         hit_color = COLOR_GREEN if hit >= 70 else COLOR_WARN

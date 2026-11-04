@@ -310,19 +310,40 @@ if __name__ == "__main__":
         assert tail[-1] == "█" and "█" not in tail[:-1], tail
         assert "█" not in sparkline(busiest[:10]), "oldest-first window would hide it"
 
-        # 8) MTP depth per decode round, from drafted/accepted/rounds counters
-        mtp_row = next(l for l in frame(cur) if "MTP depth:" in l)
-        assert "4.43 drafted/round" in mtp_row and "1.90 kept/round" in mtp_row, mtp_row
+        # 8) drafted/kept tokens per round, from the engine's own counters
+        mtp_row = next(l for l in frame(cur) if "Drafted/kept per round:" in l)
+        assert "4.43 drafted" in mtp_row and "1.90 kept" in mtp_row, mtp_row
         assert "(8819 rounds)" in mtp_row, mtp_row
+        assert "per decode round" not in mtp_row, mtp_row
         flat = dict(cur, **{"rounds_total": 0.0})
-        assert "n/a" in next(l for l in frame(flat) if "MTP depth:" in l)
+        assert "no decode rounds reported" in next(
+            l for l in frame(flat) if "Drafted/kept per round:" in l)
 
-        # 9) engine-reported iteration time: absent -> row omitted, never a fake 0
-        it_row = next(l for l in frame(cur) if "Iteration (engine):" in l)
-        assert "20ms" in it_row, it_row
+        # 9) iteration_s under its raw key; absent or negative -> row omitted
+        it_row = next(l for l in frame(cur) if "iteration_s:" in l)
+        assert "20ms" in it_row and "per decode round" not in it_row, it_row
+        zero = dict(cur, **{"iteration_s": 0.0})
+        assert "0ms" in next(l for l in frame(zero) if "iteration_s:" in l)
         no_it = dict(cur)
         no_it.pop("iteration_s", None)
-        assert not any("Iteration (engine):" in l for l in frame(no_it))
+        assert not any("iteration_s:" in l for l in frame(no_it))
+        neg = dict(cur, **{"iteration_s": -0.5})
+        assert not any("iteration_s:" in l for l in frame(neg)), "negative must not render"
+
+        # 10) fitting has to show in the rendered row, not merely stay in bounds:
+        #     only the newest sample carries traffic, so a oldest-first window
+        #     would end with a dot instead of a full bar
+        spike = deque((cur["t"] - (300 - i) * 1.0, 0.0 if i < 299 else 1000.0, 0.0)
+                      for i in range(300))
+        srow = next(l for l in frame(cur, rate_hist=spike, width=60) if "PP 120s" in l)
+        assert len(srow) == 60 and srow.endswith("█]"), srow
+
+        # 11) pruning follows the sample clock, and a backwards clock resets
+        fixed = deque()
+        assert append_rate_sample(fixed, 1010.0, 1.0, 1.0, min_gap=0.0) is True, fixed
+        assert len(fixed) == 1, fixed          # a fixed timestamp survives the prune
+        assert append_rate_sample(fixed, 900.0, 2.0, 2.0, min_gap=0.0) is True, fixed
+        assert len(fixed) == 1 and fixed[0][0] == 900.0, fixed
 
         print("tensorfold robust: OK")
     elif which == "splash":
