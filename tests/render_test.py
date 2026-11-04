@@ -186,6 +186,11 @@ if __name__ == "__main__":
         # zero queries must read as an em dash, not a fabricated 0.0%
         q_row = next(l for l in rows if "Query hit rate:" in l)
         assert "—" in q_row and "0.0%" not in q_row, q_row
+        # an absent restored counter reads n/a and an em dash, not a fake 0.0%
+        tok_row = next(l for l in rows if "Token hit rate:" in l)
+        assert "—" in tok_row and "n/a" in tok_row, tok_row
+        assert next(l for l in rows if "cache-restored:" in l).rstrip().endswith("n/a")
+        assert "(loaded)" in next(l for l in rows if "Pretty-Name" in l)
 
         # A counter the engine does not publish must read n/a, never a fake 0.
         body["metrics"] = "\n".join(
@@ -223,13 +228,16 @@ if __name__ == "__main__":
         # ---- N4: junk /props types read n/a, they neither crash nor invent ----
         body["props"] = _json.dumps({
             "memory": {"peak_bytes": True, "weights_bytes": "8",
-                       "kv_cache_bytes": float("nan"), "available_bytes": 1024},
+                       "kv_cache_bytes": float("nan"), "available_bytes": 1024,
+                       "max_safe_context": 10 ** 400},
             "settings": {"version": 5, "mtp": {"depth": True, "adaptive": "yes"}},
         })
         rows = frame(mlx_serve.sample("h", 1))
         mem = next(l for l in rows if l.startswith("│ Memory:"))
         assert mem.count("n/a") == 3, mem
         assert "1.0K" in next(l for l in rows if "Available:" in l)
+        # 10**400 is finite to Python but overflows a float: it must read n/a
+        assert "max safe ctx n/a" in next(l for l in rows if "Available:" in l)
         assert "adaptive n/a" in next(l for l in rows if "Speculation:" in l)
         body["props"] = _json.dumps(PROPS)
 
@@ -253,6 +261,15 @@ if __name__ == "__main__":
         body["metrics"] = lambda o=one: o
         ane1 = next(l for l in frame(mlx_serve.sample("h", 1)) if "ANE layers" in l)
         assert "12 layers" in ane1 and "n/a" in ane1, ane1
+        body["metrics"] = metrics_text
+
+        # a published restored counter produces a real rate and a real total
+        with_restored = metrics_text() + "mlx_serve:prefix_cache_tokens_total 500\n"
+        body["metrics"] = lambda w=with_restored: w
+        rows_b = frame(mlx_serve.sample("h", 1))
+        tok_b = next(l for l in rows_b if "Token hit rate:" in l)
+        assert "40.5%" in tok_b and "500" in tok_b, tok_b
+        assert "500" in next(l for l in rows_b if "cache-restored:" in l)
         body["metrics"] = metrics_text
 
         # ---- N1/N2: restart clears both windows and drops the stale prev ----
@@ -327,7 +344,7 @@ if __name__ == "__main__":
 
         # ---- MINOR-2: junk /v1/models must not crash the card or the frame ----
         MODELS["data"] = [{"id": 5, "alias": True,
-                           "meta": {"architecture": True, "quantization": 4},
+                           "meta": {"architecture": True, "quantization": True},
                            "bytes_resident": "9", "context_length": 128, "loaded": True}]
         bad = mlx_serve.sample("h", 1)["model"]
         assert bad["id"] is None and bad["alias"] is None, bad
@@ -336,10 +353,16 @@ if __name__ == "__main__":
         frame(mlx_serve.sample("h", 1))          # must not raise
         MODELS["data"] = [{"id": "x", "meta": "not a dict", "loaded": True}]
         assert mlx_serve.sample("h", 1)["model"]["arch"] is None
+        MODELS["data"] = [{"id": "big", "loaded": True, "meta": {},
+                           "bytes_resident": 10 ** 400, "context_length": 10 ** 400}]
+        big = mlx_serve.sample("h", 1)["model"]
+        assert big["resident"] == 0 and big["ctx"] == 0, big
         MODELS["data"] = 5               # not a list at all
         assert mlx_serve.sample("h", 1)["model"] is None
         no_card = "\n".join(frame(mlx_serve.sample("h", 1)))
         assert "unknown" in no_card and "(loaded)" not in no_card, no_card[:400]
+        MODELS["data"] = [{"id": "abc123", "loaded": False, "meta": {}}]
+        assert "NOT LOADED" in "\n".join(frame(mlx_serve.sample("h", 1)))
         MODELS["data"] = [{"id": "abc123", "loaded": True, "meta": {}}]
 
         # alias == id must not print the same string twice
