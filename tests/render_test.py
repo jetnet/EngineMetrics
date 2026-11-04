@@ -138,6 +138,7 @@ if __name__ == "__main__":
         # percentile maths and the honest-gap rendering must be covered, else a
         # broken percentile would still "render fine".
         import json as _json
+        from collections import deque
         import engines.common as _common
         import engines.tensorfold as tf
         from engines.common import percentile_from_buckets
@@ -202,10 +203,10 @@ if __name__ == "__main__":
         assert tf._quantile_strs(buckets, 0.0) == ["—", "—", "—"]
         assert tf._quantile_strs({}, 588.0) == ["—", "—", "—"]
 
-        def frame(c):
-            scr = FakeScr()
+        def frame(c, rate_hist=None, width=100):
+            scr = FakeScr(width)
             tf.draw(scr, c, None, [c], time.time() - 60, "localhost", 8100, 2, "m",
-                    rate_hist=None)
+                    rate_hist=rate_hist)
             return scr.buf
 
         lat_row = next(l for l in frame(cur) if "Latency:" in l)
@@ -260,6 +261,44 @@ if __name__ == "__main__":
                             "lat_buckets": {}, "ttft_buckets": {}})
         idle_row = next(l for l in frame(idle) if "Latency:" in l)
         assert "avg —" in idle_row and "p50 —" in idle_row and "(n=0)" in idle_row, idle_row
+        # 7) sparkline window: one point per tick, and it must not grow on a
+        #    redraw (the entrypoint re-samples on every key/mouse-wheel event)
+        from engines.common import append_rate_sample, sparkline_fit
+        # real-ish timestamps: append_rate_sample prunes against wall clock
+        base = time.time()
+        h = deque()
+        assert append_rate_sample(h, base, 1.0, 2.0, min_gap=1.8) is True, h
+        assert append_rate_sample(h, base + 0.5, 5.0, 6.0, min_gap=1.8) is False, h
+        assert len(h) == 1 and h[0] == (base, 1.0, 2.0), h
+        assert append_rate_sample(h, base + 2.0, 3.0, 4.0, min_gap=1.8) is True, h
+        assert [round(r[0] - base, 3) for r in h] == [0.0, 2.0], h
+
+        # a mouse-wheel burst spans far less than one sampling gap
+        burst = deque()
+        for i in range(100):          # 0.99s total < min_gap 1.8s
+            append_rate_sample(burst, base + i * 0.01, 9.0, 9.0, min_gap=1.8)
+        assert len(burst) == 1, len(burst)
+
+        # fitting drops the OLDEST points, so the newest survive
+        assert sparkline_fit(list(range(50)), 5) == sparkline_fit([45, 46, 47, 48, 49], 5)
+        assert sparkline_fit([1.0, 2.0], 0) == ""
+        assert len(sparkline_fit(list(range(500)), 10)) == 10
+
+        # repeated redraws of one sample must not lengthen the chart
+        hh = deque([(cur["t"] - 10.0, None, 0.0)])
+        rows = frame(cur, rate_hist=hh, width=80)
+        assert len(hh) == 2, hh            # first draw: a genuinely new sample
+        for _ in range(3):
+            rows = frame(cur, rate_hist=hh, width=80)
+        assert len(hh) == 2, "redraw grew the window: %d points" % len(hh)
+        assert max(len(l) for l in rows) <= 80, max(len(l) for l in rows)
+
+        # a long history stays inside a narrow terminal
+        long_hist = deque((cur["t"] - (600 - i) * 1.0, 1000.0, 50.0) for i in range(600))
+        narrow = frame(cur, rate_hist=long_hist, width=60)
+        assert max(len(l) for l in narrow) <= 60, max(len(l) for l in narrow)
+        assert any("PP 120s" in l for l in narrow), "sparkline row must render"
+
         print("tensorfold robust: OK")
     elif which == "splash":
         # live: two samples apart against the engine, then render with deltas

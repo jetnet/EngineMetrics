@@ -368,3 +368,32 @@ def prune_rate_hist(rate_hist, seconds=120.0):
     now = time.time()
     while rate_hist and now - rate_hist[0][0] > seconds:
         rate_hist.popleft()
+
+
+def append_rate_sample(rate_hist, t, *values, min_gap=0.0):
+    """Append one sparkline sample per real sampling tick.
+
+    draw() runs again on every key press and mouse-wheel event (the entrypoint
+    re-samples before redrawing), so appending unconditionally made the 120s
+    window grow with input traffic instead of with time: the mini charts visibly
+    lengthened on every scroll. Samples less than `min_gap` seconds newer than
+    the last one are dropped, then the window is pruned to 120s.
+    """
+    if rate_hist and t - rate_hist[-1][0] < min_gap:
+        return False
+    rate_hist.append((t,) + values)
+    prune_rate_hist(rate_hist, 120.0)
+    return True
+
+
+def sparkline_fit(points, room):
+    """Sparkline of the newest `room` samples.
+
+    Fitting must drop the oldest points: truncating the rendered string instead
+    would keep the oldest and hide the newest, which is backwards for a time
+    series. `room` comes from the row's remaining width, so the chart can never
+    run past the box border.
+    """
+    if room <= 0:
+        return ""
+    return sparkline(points[-room:])

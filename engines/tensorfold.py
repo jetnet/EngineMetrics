@@ -8,10 +8,11 @@ from datetime import datetime
 
 from .common import (
     COLOR_BORDER, COLOR_DIM, COLOR_GOOD, COLOR_GREEN, COLOR_HEADER, COLOR_RED,
-    COLOR_TITLE, COLOR_VALUE, COLOR_WARN, avg_rate, avg_wall_rate, draw_bar_row, draw_box_end,
+    COLOR_TITLE, COLOR_VALUE, COLOR_WARN, append_rate_sample, avg_rate, avg_wall_rate,
+    draw_bar_row, draw_box_end,
     draw_box_start, draw_row, draw_two_col_row, fetch_json, fetch_metrics_labeled,
     format_bytes, format_latency, format_num, format_speed, format_uptime, get_value,
-    percentile_from_buckets, prune_rate_hist, rate, sparkline, wall_rate, wall_rate_safe,
+    percentile_from_buckets, rate, sparkline_fit, wall_rate, wall_rate_safe,
 )
 
 TF_COUNTERS = [
@@ -288,10 +289,13 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     tg_eng_avg = avg_rate(history, "generation_tokens_total", "decode_seconds_total")
     tg_live_avg = avg_wall_rate(history, "completion_tokens_total")
 
-    # 120s rate history for sparklines
+    # 120s rate history for sparklines. One point per real sampling tick:
+    # redraws caused by key presses / mouse-wheel events re-use the last sample,
+    # and appending those made the mini charts grow with input traffic.
     if rate_hist is not None:
-        rate_hist.append((cur["t"], pp_engine_rate, tg_live if tg_live is not None else tg_engine_rate))
-        prune_rate_hist(rate_hist, 120.0)
+        append_rate_sample(rate_hist, cur["t"], pp_engine_rate,
+                           tg_live if tg_live is not None else tg_engine_rate,
+                           min_gap=interval * 0.9)
 
     draw_box_start(stdscr, y, x, width, "Live Throughput (delta-sampled)")
     y += 1
@@ -328,11 +332,13 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
         tg_pts = [r[2] for r in rate_hist]
         pp_max = max((v for v in pp_pts if v is not None), default=0.0)
         tg_max = max((v for v in tg_pts if v is not None), default=0.0)
-        draw_row(stdscr, y, x, f"PP 120s [{format_speed(pp_max)}]:",
-                 f"[{sparkline(pp_pts)}]", width)
+        pp_label = f"PP 120s [{format_speed(pp_max)}]:"
+        tg_label = f"TG 120s [{format_speed(tg_max)}]:"
+        draw_row(stdscr, y, x, pp_label,
+                 f"[{sparkline_fit(pp_pts, width - len(pp_label) - 5)}]", width)
         y += 1
-        draw_row(stdscr, y, x, f"TG 120s [{format_speed(tg_max)}]:",
-                 f"[{sparkline(tg_pts)}]", width)
+        draw_row(stdscr, y, x, tg_label,
+                 f"[{sparkline_fit(tg_pts, width - len(tg_label) - 5)}]", width)
         y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
@@ -393,8 +399,7 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
         w_rate = wall_rate_safe(cur, prev, "spill_written_bytes")
         l_rate = wall_rate_safe(cur, prev, "spill_loaded_tokens")
         if spill_hist is not None:
-            spill_hist.append((cur["t"], l_rate))
-            prune_rate_hist(spill_hist, 120.0)
+            append_rate_sample(spill_hist, cur["t"], l_rate, min_gap=interval * 0.9)
         written = f"{cur['spill_written_bytes'] / 2 ** 30:.2f} GiB · {int(cur['spill_written'])} writes"
         if w_rate:
             written += f" (+{format_bytes(w_rate)}/s)"
@@ -431,7 +436,9 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
         if spill_hist is not None and len(spill_hist) >= 2:
             pts = [r[1] for r in spill_hist]
             rmax = max((v for v in pts if v is not None), default=0.0)
-            draw_row(stdscr, y, x, f"Restore 120s [{format_speed(rmax)}]:", f"[{sparkline(pts)}]", width)
+            rlabel = f"Restore 120s [{format_speed(rmax)}]:"
+            draw_row(stdscr, y, x, rlabel,
+                     f"[{sparkline_fit(pts, width - len(rlabel) - 5)}]", width)
             y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
