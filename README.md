@@ -36,6 +36,12 @@ Like `htop` for your LLM engine.
 │ MTP Acceptance: 48.9%  (70,755/144,736)                            │
 │ Cache Hit (tokens): 75.4%  (1.4M/1.9M)                             │
 └────────────────────────────────────────────────────────────────────┘
+┌─ Cache reuse ──────────────────────────────────────────────────────┐
+│ Kept bytes: 3.0G  kept_bytes_cap 0                                 │
+│ Kept mix: own 17  shared 15  chats 17  rows 1.2M                   │
+│ Prefix waits: 0 waits  0 tok not re-prefilled                      │
+│ Chats continued (not own turn): 0 streams  0 tok prefilled         │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Layout
@@ -73,7 +79,7 @@ exporter, no dependencies.
 | Backend | Detection | What you get |
 |---|---|---|
 | **vLLM** | `vllm:*` keys in `/metrics` | Live PP/TG (engine-time + wall-clock, delta-sampled), 120s sparklines, batch shape (tokens/step), KV occupancy + pool tokens, prefix-cache hit rates (live + cumulative), MTP/spec acceptance with τ and per-position decay, ITL/TTFT/E2E/queue latency with p50/p90/p99 percentiles, preemption warnings, finish-reason accounting, scheduler fairness gauges, tool-call traffic profile, model card from `cache_config_info` |
-| **TensorFold** | `backend: "tensorfold"` in `/health` | Live PP/TG (engine-time + wall-clock), 120s sparklines, stream states, shared-pool occupancy, kept prompts, MTP acceptance, TTFT/latency averages plus p50/p90/p99 interpolated from the `/metrics` histogram buckets (`~` = estimate inside a coarse bucket, `>` = tail beyond the last finite bucket), cache-hit %, multi-prefill stats, SSD spill tier panel (stored/written/loaded/restored, fill bar via `--spill-cap`, restore p50/p95, failures, 120s restore sparkline) |
+| **TensorFold** | `backend: "tensorfold"` in `/health` | Live PP/TG (engine-time + wall-clock), 120s sparklines, stream states, shared-pool occupancy, kept prompts, MTP acceptance, TTFT/latency averages plus p50/p90/p99 interpolated from the `/metrics` histogram buckets (`~` = estimate inside a coarse bucket, `>` = tail beyond the last finite bucket), cache-hit %, multi-prefill stats, cache-reuse panel (kept bytes/mix, prefix waits, continued chats), SSD spill tier panel (stored/written/loaded/restored, fill bar via `--spill-cap`, restore p50/p95, failures, 120s restore sparkline) |
 | **mlx-serve** | `mlx_serve:*` keys in `/metrics` (checked before `vllm:*` — mlx-serve emits both) | Live TG/PP (wall-clock, from `*_live` gauges that include in-flight slots), in-flight prefill progress bar, GPU util + memory footprint, model card (arch/quant/ctx/MTP/resident), 120s sparklines, prefix-cache hit rates, TTFT/latency averages, serial-decode reasons |
 | **oMLX** | `engine_pool` in `/health` (fallback: `models_discovered` in `/api/status`) | Live TG from per-slot `tokens_per_second` (in-flight), native prefill progress bar with ETA (`processed`/`total`/`speed`), loaded-model cards (engine_type/ctx/size), memory pool + pressure levels, cache efficiency, engine cumulative TPS averages, device info (chip/GPU cores), custom-kernel availability |
 | **Splash** | `splash_*` keys in `/metrics` (dashboard reads the JSON `/status` mirror) | Live PP/TG (engine-time + wall-clock, delta-sampled), 120s sparklines, scheduler streams + decode batch-width mix (b1–b4), admission queue, KV page-pool occupancy + extent stats, prompt-cache hit rate + state store, memory governor + thermal state, TTFT/ITL p50/p95, DFlash2 draft acceptance, last-batch detail, device card (chip/GPU cores/ANE split) |
@@ -139,17 +145,20 @@ delta-samples between polls:
   engine this was built on); with several label sets the percentiles render `—`
   rather than a silently mixed series (the average and `n` still come from the
   flat last-wins sum/count).
-- **Cache reuse panel** = `/health` `kept_bytes` (memory held by kept prompts).
-  Its `kept_bytes_cap` is shown only when non-zero: a reported cap of `0` has no
-  documented meaning, so it is not claimed to mean "unlimited". `kept_mix` is
-  shown under its own key names (`own`/`shared`/`chats`/`rows`) because the
-  engine publishes no HELP text for it. `prefix_waits`/`prefix_wait_tokens` and
+- **Cache reuse panel** = the `/health` reuse keys. `kept_bytes`, `kept_bytes_cap`
+  and `kept_mix` publish no HELP text, so they are shown under their own key
+  names and never interpreted: a reported `kept_bytes_cap 0` is displayed as `0`
+  rather than dropped or called "unlimited", and `kept_mix` keeps its
+  `own`/`shared`/`chats`/`rows` keys. `prefix_waits`/`prefix_wait_tokens` and
   `chats_continued`/`chats_continued_prefill_tokens` are labelled from their
   `/metrics` HELP text (requests that waited for a prefix another request was
   prefilling, and the prompt tokens they did not prefill again; streams that
-  continued without resuming their own turn state, and the tokens they
-  prefilled). Absent keys print `n/a` and hide the panel when nothing is
-  reported.
+  continued *without* resuming their own turn state, and the tokens they
+  prefilled — that is a cache miss that prefills again, not a healthy reuse).
+  Every field is rendered independently: half of a counter pair being absent
+  prints `n/a` instead of `0`, a malformed or non-finite value counts as absent,
+  and the whole panel is omitted when the engine reports nothing. It is drawn
+  below Totals so a short terminal clips this panel before the main ones.
 
 ## How the vLLM numbers are derived
 

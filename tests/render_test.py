@@ -106,7 +106,7 @@ if __name__ == "__main__":
                  "reuse": {"kept_bytes": 2997771520.0, "kept_bytes_cap": 0.0,
                            "prefix_waits": 3.0, "prefix_wait_tokens": 40960.0,
                            "chats_continued": 2.0, "chats_continued_prefill_tokens": 8192.0,
-                           "mix": {"own": 17.0, "shared": 15.0, "chats": 17.0,
+                           "mix": {"own": 17.0, "shared": 15.0, "chats": 11.0,
                                    "rows": 1162688.0}}}
             s.update(over)
             return s
@@ -164,7 +164,7 @@ if __name__ == "__main__":
                "tensorfold:generation_tokens_total 500"])
         HEALTH = {"ok": True, "backend": "tensorfold", "busy": False,
                   "kept_bytes": 3033006080, "kept_bytes_cap": 0,
-                  "kept_mix": {"own": 17, "shared": 15, "chats": 17, "rows": 1162688},
+                  "kept_mix": {"own": 17, "shared": 15, "chats": 11, "rows": 1162688},
                   "prefix_waits": 2, "prefix_wait_tokens": 40960,
                   "chats_continued": 1, "chats_continued_prefill_tokens": 8192}
         # fetch_metrics_labeled() and fetch_json() both read through http_get()
@@ -218,19 +218,42 @@ if __name__ == "__main__":
         # 5) cache-reuse parse from real /health keys; absent keys stay None
         r = cur["reuse"]
         assert r["kept_bytes"] == 3033006080.0 and r["kept_bytes_cap"] == 0.0, r
-        assert r["mix"] == {"own": 17.0, "shared": 15.0, "chats": 17.0,
+        assert r["mix"] == {"own": 17.0, "shared": 15.0, "chats": 11.0,
                            "rows": 1162688.0}, r
         assert r["prefix_waits"] == 2.0 and r["chats_continued_prefill_tokens"] == 8192.0, r
-        mem_row = next(l for l in frame(cur) if "Kept memory:" in l)
-        # a reported cap of 0 must NOT be rendered (its meaning is undocumented)
-        assert "3.0G" in mem_row and "cap" not in mem_row, mem_row
+        mem_row = next(l for l in frame(cur) if "Kept bytes:" in l)
+        # a reported cap of 0 is shown with its raw key so it differs from absent
+        assert "3.0G" in mem_row and "kept_bytes_cap 0" in mem_row, mem_row
         mix_row = next(l for l in frame(cur) if "Kept mix:" in l)
-        assert "own 17" in mix_row and "rows 1.2M" in mix_row, mix_row
+        assert "own 17" in mix_row and "shared 15" in mix_row, mix_row
+        assert "chats 11" in mix_row and "rows 1.2M" in mix_row, mix_row
         pw_row = next(l for l in frame(cur) if "Prefix waits:" in l)
         assert "2 waits" in pw_row and "41.0K tok not re-prefilled" in pw_row, pw_row
-        # nothing reported -> the panel hides instead of printing four zero rows
-        ghost = dict(cur, reuse={k: None for k in r})
-        assert not any("Cache reuse" in l for l in frame(ghost)), "panel must hide"
+        cc_row = next(l for l in frame(cur) if "Chats continued" in l)
+        assert "1 streams" in cc_row and "8.2K tok prefilled" in cc_row, cc_row
+        assert "not re-prefilled" not in cc_row, cc_row
+
+        # 6) honest gaps through the real sample() path, not a hand-built dict
+        HEALTH = {"prefix_waits": 3, "kept_mix": {"own": 5}}
+        part = tf.sample("localhost", 8100)
+        assert part["reuse"]["prefix_wait_tokens"] is None, part["reuse"]
+        assert part["reuse"]["kept_bytes"] is None, part["reuse"]
+        prow = next(l for l in frame(part) if "Prefix waits:" in l)
+        assert "3 waits" in prow and "n/a" in prow and "0 tok" not in prow, prow
+        pmix = next(l for l in frame(part) if "Kept mix:" in l)
+        assert "own 5" in pmix and "shared n/a" in pmix, pmix
+
+        # a reported 0 is data, not absence; nothing reported hides the panel
+        HEALTH = {"kept_bytes": 0}
+        zero = tf.sample("localhost", 8100)
+        assert any("Cache reuse" in l for l in frame(zero)), "a reported 0 must show"
+        HEALTH = {"ok": True}
+        absent = tf.sample("localhost", 8100)
+        assert not any("Cache reuse" in l for l in frame(absent)), "panel must hide"
+        HEALTH = {"kept_bytes": 1024, "kept_bytes_cap": 137438953472}
+        capped = tf.sample("localhost", 8100)
+        cap_row = next(l for l in frame(capped) if "Kept bytes:" in l)
+        assert "kept_bytes_cap 137.4G" in cap_row, cap_row
 
         idle = dict(cur, **{"tensorfold:request_latency_seconds_count": 0.0,
                             "tensorfold:time_to_first_token_seconds_count": 0.0,

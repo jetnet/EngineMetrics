@@ -8,7 +8,7 @@ from datetime import datetime
 
 from .common import (
     COLOR_BORDER, COLOR_DIM, COLOR_GOOD, COLOR_GREEN, COLOR_HEADER, COLOR_RED,
-    COLOR_TITLE, COLOR_WARN, avg_rate, avg_wall_rate, draw_bar_row, draw_box_end,
+    COLOR_TITLE, COLOR_VALUE, COLOR_WARN, avg_rate, avg_wall_rate, draw_bar_row, draw_box_end,
     draw_box_start, draw_row, draw_two_col_row, fetch_json, fetch_metrics_labeled,
     format_bytes, format_latency, format_num, format_speed, format_uptime, get_value,
     percentile_from_buckets, prune_rate_hist, rate, sparkline, wall_rate, wall_rate_safe,
@@ -50,9 +50,23 @@ METRIC_FALLBACK = {
 def _num(v):
     try:
         v = float(v or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
     return v if v == v and abs(v) != float("inf") else 0.0
+
+
+def _opt_num(v):
+    """A finite number, or None when the engine did not report a usable value.
+    Used wherever absent (or malformed) must not become a fabricated 0."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if f != f or abs(f) == float("inf"):
+        return None
+    return f
 
 
 def _buckets(series, base):
@@ -112,6 +126,23 @@ SPILL_FIELDS = [
     "write_failed", "crc_failed", "load_failed", "load_unfit", "disk_free_bytes",
 ]
 
+# /health reuse keys. kept_mix is a nested dict of its own keys; the rest are
+# scalars. None means "not reported" and must render as n/a, never as 0.
+REUSE_FIELDS = [
+    "kept_bytes", "kept_bytes_cap", "prefix_waits", "prefix_wait_tokens",
+    "chats_continued", "chats_continued_prefill_tokens",
+]
+MIX_FIELDS = ["own", "shared", "chats", "rows"]
+
+
+def _reuse_reported(reuse):
+    """True when /health reported anything the reuse panel can display."""
+    if not isinstance(reuse, dict):
+        return False
+    if reuse.get("mix"):
+        return True
+    return any(reuse.get(k) is not None for k in REUSE_FIELDS)
+
 
 def sample(host, port):
     """One TensorFold sample: wall time + counters from /metrics + /health."""
@@ -162,21 +193,20 @@ def sample(host, port):
     s["streams"] = health.get("streams", {}) or {}
     s["multi_prefill"] = health.get("multi_prefill", {}) or {}
     # Cache-reuse picture from /health. Only prefix_waits*, chats_continued* and
-    # kept_prompts have authoritative /metrics HELP text; kept_mix and
-    # kept_bytes_cap are not documented there, so they are shown under their own
-    # key names and never interpreted (a cap of 0 is NOT claimed to mean
-    # "unlimited"). Absent keys stay None so the panel can print an honest gap.
-    reuse = {k: (_num(health[k]) if k in health else None)
-             for k in ("kept_bytes", "kept_bytes_cap", "prefix_waits", "prefix_wait_tokens",
-                       "chats_continued", "chats_continued_prefill_tokens")}
-    mix = health.get("kept_mix")
-    reuse["mix"] = ({k: _num(mix[k]) for k in ("own", "shared", "chats", "rows") if k in mix}
-                    if isinstance(mix, dict) else None)
+    # kept_prompts have authoritative /metrics HELP text; kept_mix, kept_bytes and
+    # kept_bytes_cap have none, so they are shown under their own key names and
+    # never interpreted (a cap of 0 is NOT claimed to mean "unlimited"). Anything
+    # absent, null or non-finite stays None so the panel prints an honest gap.
+    reuse = {k: _opt_num(health.get(k)) for k in REUSE_FIELDS}
+    mix_raw = health.get("kept_mix")
+    mix = None
+    if isinstance(mix_raw, dict) and any(k in mix_raw for k in MIX_FIELDS):
+        mix = {k: _opt_num(mix_raw.get(k)) for k in MIX_FIELDS}
+    reuse["mix"] = mix
     s["reuse"] = reuse
     live = health.get("live")
     s["live"] = live if isinstance(live, dict) else {}
     s["max_batch_size"] = _num(health.get("max_batch_size"))
-    s["kept_bytes"] = float(health.get("kept_bytes", 0) or 0)
     spill = health.get("spill") or {}
     s["spill_present"] = bool(spill)
     for k in SPILL_FIELDS:
@@ -311,6 +341,10 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     pool = cur["pool_tokens"]
     free = cur["pool_free_tokens"]
     used_pct = (pool - free) / pool * 100 if pool > 0 else 0.0
+    # single source of truth for the reuse numbers (kept_bytes used to live in two
+    # places with different absent-value semantics)
+    reuse = cur.get("reuse") if isinstance(cur.get("reuse"), dict) else {}
+    kb = reuse.get("kept_bytes")
     ratios = cur.get("kv_ratios", []) or []
     kv_ratio = max((v for _, v in ratios), default=0.0) * 100
     if not kv_ratio:
@@ -377,7 +411,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
                          f"{format_num(pool - free)} / {format_num(pool)} rows free {format_num(free)}",
                          "Stored:", f"{stored / 2 ** 30:.1f} GiB ({entries} entries)")
         y += 1
-        draw_two_col_row(stdscr, y, x, width, "Kept prompts:", f"{kept} ({format_bytes(cur.get('kept_bytes', 0.0))})",
+        kept_mem = "n/a" if kb is None else format_bytes(kb)
+        draw_two_col_row(stdscr, y, x, width, "Kept prompts:", f"{kept} ({kept_mem})",
                          "Written:", written)
         y += 1
         draw_two_col_row(stdscr, y, x, width, "Stream KV ratio:", f"{kv_ratio:.1f}% (per-stream / ctx window)",
@@ -400,47 +435,6 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
             y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
-
-    # ---- Cache reuse (only when the engine reports it) ----
-    reuse = cur.get("reuse") or {}
-    if any(v is not None for k, v in reuse.items() if k != "mix") or reuse.get("mix"):
-        draw_box_start(stdscr, y, x, width, "Cache reuse (cumulative)")
-        y += 1
-        kb = reuse.get("kept_bytes")
-        cap = reuse.get("kept_bytes_cap")
-        if kb is None:
-            draw_row(stdscr, y, x, "Kept memory:", "n/a (not reported)", width, value_color=COLOR_DIM)
-        else:
-            val = format_bytes(kb) + (f"  cap {format_bytes(cap)}" if cap else "")
-            draw_row(stdscr, y, x, "Kept memory:", val, width)
-        y += 1
-        mix = reuse.get("mix")
-        if mix:
-            draw_row(stdscr, y, x, "Kept mix:",
-                     f"own {int(mix.get('own', 0))}  shared {int(mix.get('shared', 0))}  "
-                     f"chats {int(mix.get('chats', 0))}  rows {format_num(mix.get('rows', 0))}", width)
-        else:
-            draw_row(stdscr, y, x, "Kept mix:", "n/a (no kept_mix in /health)", width, value_color=COLOR_DIM)
-        y += 1
-        pw, pwt = reuse.get("prefix_waits"), reuse.get("prefix_wait_tokens")
-        if pw is None and pwt is None:
-            draw_row(stdscr, y, x, "Prefix waits:", "n/a (not reported)", width, value_color=COLOR_DIM)
-        else:
-            # HELP: requests that waited for a prefix another request was prefilling;
-            # the tokens are the prompt tokens they did not prefill again.
-            draw_row(stdscr, y, x, "Prefix waits:",
-                     f"{int(pw or 0)} waits  {format_num(pwt or 0)} tok not re-prefilled", width)
-        y += 1
-        cc, cct = reuse.get("chats_continued"), reuse.get("chats_continued_prefill_tokens")
-        if cc is None and cct is None:
-            draw_row(stdscr, y, x, "Chats continued:", "n/a (not reported)", width, value_color=COLOR_DIM)
-        else:
-            # HELP: streams continued without resuming from their own turn state
-            draw_row(stdscr, y, x, "Chats continued:",
-                     f"{int(cc or 0)} streams  {format_num(cct or 0)} tok prefilled", width)
-        y += 1
-        draw_box_end(stdscr, y, x, width)
-        y += 1
 
     # ---- Averages (cumulative histograms) ----
     lat_sum = cur["tensorfold:request_latency_seconds_sum"]
@@ -498,6 +492,60 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
         y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
+
+    # ---- Cache reuse (below Totals, so a short terminal clips only this panel) ----
+    if _reuse_reported(reuse):
+        draw_box_start(stdscr, y, x, width, "Cache reuse")
+        y += 1
+        # kept_bytes / kept_bytes_cap / kept_mix publish no HELP text: shown under
+        # their own key names, never interpreted. A reported cap of 0 is rendered
+        # as 0 (not dropped, not called "unlimited") so reported and absent differ.
+        cap = reuse.get("kept_bytes_cap")
+        mem = "n/a" if kb is None else format_bytes(kb)
+        if cap is not None:
+            mem += "  kept_bytes_cap " + format_bytes(cap)
+        draw_row(stdscr, y, x, "Kept bytes:", mem, width,
+                 value_color=COLOR_VALUE if kb is not None else COLOR_DIM)
+        y += 1
+        mix = reuse.get("mix")
+        if mix:
+            parts = []
+            for name in MIX_FIELDS:
+                v = mix.get(name)
+                if v is None:
+                    parts.append(name + " n/a")
+                elif name == "rows":
+                    parts.append(name + " " + format_num(v))
+                else:
+                    parts.append(name + " " + str(int(v)))
+            draw_row(stdscr, y, x, "Kept mix:", "  ".join(parts), width)
+        else:
+            draw_row(stdscr, y, x, "Kept mix:", "n/a (kept_mix absent or unrecognised)",
+                     width, value_color=COLOR_DIM)
+        y += 1
+        pw, pwt = reuse.get("prefix_waits"), reuse.get("prefix_wait_tokens")
+        if pw is None and pwt is None:
+            draw_row(stdscr, y, x, "Prefix waits:", "n/a (not reported)", width, value_color=COLOR_DIM)
+        else:
+            # HELP: requests that waited for a prefix another request was prefilling;
+            # the tokens are the prompt tokens they did not prefill again.
+            waits = "n/a" if pw is None else f"{int(pw)} waits"
+            skipped = "n/a" if pwt is None else f"{format_num(pwt)} tok not re-prefilled"
+            draw_row(stdscr, y, x, "Prefix waits:", waits + "  " + skipped, width)
+        y += 1
+        cc, cct = reuse.get("chats_continued"), reuse.get("chats_continued_prefill_tokens")
+        if cc is None and cct is None:
+            draw_row(stdscr, y, x, "Chats continued:", "n/a (not reported)", width, value_color=COLOR_DIM)
+        else:
+            # HELP: streams that continued WITHOUT resuming from their own turn
+            # state (a rewind, or it was dropped) - a cache miss that prefills again.
+            streams = "n/a" if cc is None else f"{int(cc)} streams"
+            tok = "n/a" if cct is None else f"{format_num(cct)} tok prefilled"
+            draw_row(stdscr, y, x, "Chats continued (not own turn):",
+                     streams + "  " + tok, width)
+        y += 1
+        draw_box_end(stdscr, y, x, width)
+        y += 1
 
     try:
         stdscr.addstr(y, x, "─" * width, curses.color_pair(COLOR_BORDER))
