@@ -7,11 +7,11 @@ from collections import deque
 from datetime import datetime
 
 from .common import (
-    COLOR_BORDER, COLOR_DIM, COLOR_GOOD, COLOR_GREEN, COLOR_RED, COLOR_TITLE,
-    COLOR_WARN, avg_rate, avg_wall_rate, draw_bar_row, draw_box_end,
-    draw_box_start, draw_row, fetch_json, fetch_metrics_labeled, format_num,
-    format_speed, format_uptime, get_value, prune_rate_hist, rate, sparkline,
-    wall_rate,
+    COLOR_BORDER, COLOR_DIM, COLOR_GOOD, COLOR_GREEN, COLOR_HEADER, COLOR_RED,
+    COLOR_TITLE, COLOR_WARN, avg_rate, avg_wall_rate, draw_bar_row, draw_box_end,
+    draw_box_start, draw_row, draw_two_col_row, fetch_json, fetch_metrics_labeled,
+    format_bytes, format_num, format_speed, format_uptime, get_value,
+    prune_rate_hist, rate, sparkline, wall_rate, wall_rate_safe,
 )
 
 TF_COUNTERS = [
@@ -53,6 +53,16 @@ def _num(v):
     except (TypeError, ValueError):
         return 0.0
     return v if v == v and abs(v) != float("inf") else 0.0
+
+
+# /health "spill" dict (patch 0088 disk tier) — flattened as spill_<field> so
+# delta-rate math sees flat counters. Older engines without the tier simply
+# don't set spill_present.
+SPILL_FIELDS = [
+    "gib", "entries", "stored_bytes", "written", "written_bytes", "loaded",
+    "loaded_bytes", "loaded_tokens", "restore_ms_p50", "restore_ms_p95",
+    "write_failed", "crc_failed", "load_failed", "load_unfit", "disk_free_bytes",
+]
 
 
 def sample(host, port):
@@ -102,6 +112,11 @@ def sample(host, port):
     live = health.get("live")
     s["live"] = live if isinstance(live, dict) else {}
     s["max_batch_size"] = _num(health.get("max_batch_size"))
+    s["kept_bytes"] = float(health.get("kept_bytes", 0) or 0)
+    spill = health.get("spill") or {}
+    s["spill_present"] = bool(spill)
+    for k in SPILL_FIELDS:
+        s[f"spill_{k}"] = float(spill.get(k, 0) or 0)
     if "busy" in health:
         s["busy"] = bool(health["busy"])
     else:
@@ -119,14 +134,17 @@ def tick(stdscr, args, state):
             state["context_length"] = mm["data"][0].get("context_length")
     if not cur.get("_error"):
         state["history"].append(cur)
+    if "spill_hist" not in state:
+        state["spill_hist"] = deque()
     draw(stdscr, cur, state["prev"], state["history"], state["start_time"],
          args.host, args.port, args.interval, state["model_name"], state["rate_hist"],
-         ctx_len=state.get("context_length"))
+         ctx_len=state.get("context_length"),
+         spill_hist=state["spill_hist"], spill_cap=getattr(args, "spill_cap", None))
     state["prev"] = cur if not cur.get("_error") else state["prev"]
 
 
 def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_name, rate_hist=None,
-         ctx_len=None):
+         ctx_len=None, spill_hist=None, spill_cap=None):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
     x = 0
@@ -225,36 +243,97 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     draw_box_end(stdscr, y, x, width)
     y += 1
 
-    # ---- Live cache ----
+    # ---- Live cache (two columns: RAM pool | SSD spill tier, when present) ----
     pool = cur["pool_tokens"]
     free = cur["pool_free_tokens"]
     used_pct = (pool - free) / pool * 100 if pool > 0 else 0.0
-    ratios = cur["kv_ratios"]
+    ratios = cur.get("kv_ratios", []) or []
     kv_ratio = max((v for _, v in ratios), default=0.0) * 100
+    if not kv_ratio:
+        kv_ratio = get_value(cur, "tensorfold:kv_cache_usage_ratio") * 100
+    kept = int(cur["kept_prompts"])
     ctx = int(cur["context_length"] or ctx_len or 0)
+    cache_color = COLOR_GREEN if used_pct < 70 else COLOR_WARN if used_pct < 90 else COLOR_RED
+    kv_color = COLOR_GREEN if kv_ratio < 70 else COLOR_WARN if kv_ratio < 90 else COLOR_RED
+    spill = bool(cur.get("spill_present"))
 
     draw_box_start(stdscr, y, x, width, "Live Cache")
     y += 1
-    if pool > 0:
-        cache_color = COLOR_GREEN if used_pct < 70 else COLOR_WARN if used_pct < 90 else COLOR_RED
+    if spill:
+        if pool > 0:
+            draw_bar_row(stdscr, y, x, "Pool occupancy:", used_pct, width, cache_color)
+            y += 1
+    elif pool > 0:
         draw_bar_row(stdscr, y, x, "Pool occupancy:", used_pct, width, cache_color)
         y += 1
         draw_row(stdscr, y, x, "Pool:", f"{format_num(pool - free)} / {format_num(pool)} rows free {format_num(free)}", width)
         y += 1
         draw_row(stdscr, y, x, "Stream KV ratio:", f"{kv_ratio:.1f}% (per-stream / ctx window)", width)
         y += 1
-        draw_row(stdscr, y, x, "Kept prompts:", f"{int(cur['kept_prompts'])}   context window {format_num(ctx)}", width)
+        draw_row(stdscr, y, x, "Kept prompts:", f"{kept}   context window {format_num(ctx)}", width)
         y += 1
     else:
-        # slim /health: no shared-pool or kept-prompts info, only per-pool KV ratios
-        cache_color = COLOR_GREEN if kv_ratio < 70 else COLOR_WARN if kv_ratio < 90 else COLOR_RED
-        draw_bar_row(stdscr, y, x, "KV usage (max):", kv_ratio, width, cache_color)
+        # slim /health: no shared-pool gauge, only per-pool KV ratios
+        draw_bar_row(stdscr, y, x, "KV usage (max):", kv_ratio, width, kv_color)
         y += 1
         per = "  ".join(f"{p}:{v * 100:.1f}%" for p, v in ratios) or "n/a"
         draw_row(stdscr, y, x, "KV per pool:", per, width)
         y += 1
         draw_row(stdscr, y, x, "Context window:", format_num(ctx) if ctx else "n/a", width)
         y += 1
+    if spill:
+        stored = cur["spill_stored_bytes"]
+        entries = int(cur["spill_entries"])
+        cap = cur.get("spill_gib") or spill_cap
+        if cap:
+            fill_pct = stored / (cap * 2 ** 30) * 100
+            fill_color = COLOR_GREEN if fill_pct < 70 else COLOR_WARN if fill_pct < 90 else COLOR_RED
+            draw_bar_row(stdscr, y, x, "Spill fill:", fill_pct, width, fill_color,
+                         suffix=f"{stored / 2 ** 30:.1f}/{cap:g} GiB")
+            y += 1
+        # delta rates: None on engine restart (negative delta) or an idle window — honest gap
+        w_rate = wall_rate_safe(cur, prev, "spill_written_bytes")
+        l_rate = wall_rate_safe(cur, prev, "spill_loaded_tokens")
+        if spill_hist is not None:
+            spill_hist.append((cur["t"], l_rate))
+            prune_rate_hist(spill_hist, 120.0)
+        written = f"{cur['spill_written_bytes'] / 2 ** 30:.2f} GiB · {int(cur['spill_written'])} writes"
+        if w_rate:
+            written += f" (+{format_bytes(w_rate)}/s)"
+        loaded = f"{cur['spill_loaded_bytes'] / 2 ** 30:.2f} GiB · {format_num(cur['spill_loaded_tokens'])} tok"
+        if l_rate:
+            loaded += f" (+{format_num(l_rate)}/s)"
+        fails = (int(cur["spill_write_failed"]), int(cur["spill_crc_failed"]),
+                 int(cur["spill_load_failed"]), int(cur["spill_load_unfit"]))
+        fail_color = COLOR_GREEN if not any(fails) else COLOR_RED
+        draw_two_col_row(stdscr, y, x, width, "RAM pool", "", "SSD spill tier (streaming)", "",
+                         left_label_color=COLOR_HEADER, right_label_color=COLOR_HEADER)
+        y += 1
+        draw_two_col_row(stdscr, y, x, width, "Pool:",
+                         f"{format_num(pool - free)} / {format_num(pool)} rows free {format_num(free)}",
+                         "Stored:", f"{stored / 2 ** 30:.1f} GiB ({entries} entries)")
+        y += 1
+        draw_two_col_row(stdscr, y, x, width, "Kept prompts:", f"{kept} ({format_bytes(cur.get('kept_bytes', 0.0))})",
+                         "Written:", written)
+        y += 1
+        draw_two_col_row(stdscr, y, x, width, "Stream KV ratio:", f"{kv_ratio:.1f}% (per-stream / ctx window)",
+                         "Loaded:", loaded)
+        y += 1
+        draw_two_col_row(stdscr, y, x, width, "Context window:", format_num(ctx),
+                         "Restore p50/p95:", f"{cur['spill_restore_ms_p50']:.1f} / {cur['spill_restore_ms_p95']:.1f} ms")
+        y += 1
+        draw_two_col_row(stdscr, y, x, width, "", "",
+                         "Failures:", f"write {fails[0]} · crc {fails[1]} · load {fails[2]} · unfit {fails[3]}",
+                         right_value_color=fail_color)
+        y += 1
+        draw_two_col_row(stdscr, y, x, width, "", "",
+                         "Disk free:", format_bytes(cur["spill_disk_free_bytes"]))
+        y += 1
+        if spill_hist is not None and len(spill_hist) >= 2:
+            pts = [r[1] for r in spill_hist]
+            rmax = max((v for v in pts if v is not None), default=0.0)
+            draw_row(stdscr, y, x, f"Restore 120s [{format_speed(rmax)}]:", f"[{sparkline(pts)}]", width)
+            y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
 
