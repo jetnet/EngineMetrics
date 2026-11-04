@@ -191,6 +191,9 @@ if __name__ == "__main__":
         assert "—" in tok_row and "n/a" in tok_row, tok_row
         assert next(l for l in rows if "cache-restored:" in l).rstrip().endswith("n/a")
         assert "(loaded)" in next(l for l in rows if "Pretty-Name" in l)
+        # the positive fields on the card are pinned too, not only the label
+        assert "4-bit" in joined and "resident 1.1GB" in joined, joined
+        assert "ctx 1.0K" in joined, joined
 
         # A counter the engine does not publish must read n/a, never a fake 0.
         body["metrics"] = "\n".join(
@@ -270,6 +273,13 @@ if __name__ == "__main__":
         tok_b = next(l for l in rows_b if "Token hit rate:" in l)
         assert "40.5%" in tok_b and "500" in tok_b, tok_b
         assert "500" in next(l for l in rows_b if "cache-restored:" in l)
+        # a published zero is a real value, not a gap: presence, not truthiness
+        with_zero = metrics_text() + "mlx_serve:prefix_cache_tokens_total 0\n"
+        body["metrics"] = lambda w=with_zero: w
+        rows_z = frame(mlx_serve.sample("h", 1))
+        tok_z = next(l for l in rows_z if "Token hit rate:" in l)
+        assert "0.0%" in tok_z and "n/a" not in tok_z, tok_z
+        assert "n/a" not in next(l for l in rows_z if "cache-restored:" in l)
         body["metrics"] = metrics_text
 
         # ---- N1/N2: restart clears both windows and drops the stale prev ----
@@ -361,6 +371,7 @@ if __name__ == "__main__":
         assert mlx_serve.sample("h", 1)["model"] is None
         no_card = "\n".join(frame(mlx_serve.sample("h", 1)))
         assert "unknown" in no_card and "(loaded)" not in no_card, no_card[:400]
+        assert "NOT LOADED" not in no_card, no_card[:400]
         MODELS["data"] = [{"id": "abc123", "loaded": False, "meta": {}}]
         assert "NOT LOADED" in "\n".join(frame(mlx_serve.sample("h", 1)))
         MODELS["data"] = [{"id": "abc123", "loaded": True, "meta": {}}]
