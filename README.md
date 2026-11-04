@@ -30,9 +30,9 @@ Like `htop` for your LLM engine.
 │                                   Failures: 0 · Disk free: 1.69T   │
 │ Restore 120s [8.5K]: [·····▄▅▆▇█▆▅▄▃·]                             │
 └────────────────────────────────────────────────────────────────────┘
-┌─ Averages (cumulative) ────────────────────────────────────────────┐
-│ Avg Latency: 10.21s  (n=588)                                       │
-│ Avg TTFT: 1.85s  (n=588)                                           │
+┌─ Latency (cumulative) ─────────────────────────────────────────────┐
+│ Latency: avg 4.08s   p50 ~2.46s  p90 ~8.60s  p99 ~37.95s  (n=588)  │
+│ TTFT: avg 1.85s   p50 ~1.52s  p90 ~4.14s  p99 ~9.42s  (n=588)      │
 │ MTP Acceptance: 48.9%  (70,755/144,736)                            │
 │ Cache Hit (tokens): 75.4%  (1.4M/1.9M)                             │
 └────────────────────────────────────────────────────────────────────┘
@@ -129,8 +129,15 @@ delta-samples between polls:
   `/health` `spill.gib` (its configured `SPILL_GIB`); `--spill-cap GIB` is a
   fallback for older engines — never guessed. The
   `Restore 120s` sparkline samples restored tok/s exactly like the PP/TG ones.
-- **Averages** = `request_latency_seconds` / `time_to_first_token_seconds`
-  histogram sum ÷ count.
+- **Latency rows** = `request_latency_seconds` / `time_to_first_token_seconds`:
+  the average is histogram sum ÷ count; p50/p90/p99 are interpolated from the
+  cumulative `_bucket` counts with the same helper the vLLM backend uses. `~`
+  marks an estimate inside a coarse bucket, `>` means the quantile falls past the
+  last finite bucket (only a lower bound is knowable), `—` means the server
+  exposes no buckets or nothing has finished yet. These are lifetime-cumulative,
+  not windowed. Assumption: one label set per histogram (verified against the
+  engine this was built on); several label sets render `—` instead of silently
+  mixing series.
 
 ## How the vLLM numbers are derived
 

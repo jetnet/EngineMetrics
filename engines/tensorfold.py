@@ -73,6 +73,8 @@ def _buckets(series, base):
             continue
         if count != count or abs(count) == float("inf"):
             continue    # NaN/Inf count: unusable bucket, better skipped than 0
+        if bound in out:
+            return {}   # several label sets: refuse to silently mix series
         out[bound] = count
     return out
 

@@ -1,8 +1,8 @@
 """Headless render test: one clean frame per engine backend (live where reachable).
 
 Usage: python3 tests/render_test.py [omlx|mlx-serve|vllm|vllm-synthetic|tensorfold|
-         tensorfold-synthetic|tensorfold-robust|splash|splash-synthetic|splash-robust]
-         [host [port]]
+         tensorfold-synthetic|tensorfold-robust|splash|splash-synthetic|
+         splash-fresh|splash-robust] [host [port]]
 """
 import os
 import sys
@@ -177,8 +177,10 @@ if __name__ == "__main__":
 
         # 3) estimates are marked; an unobservable tail claims no exactness
         strs = tf._quantile_strs(buckets, count)
-        assert strs[0].startswith("~") and strs[2] == "~37.95s", strs
-        assert tf._quantile_strs({1.0: 5.0, 60.0: 10.0}, 20.0)[2] == ">60.00s"
+        assert strs == ["~2.46s", "~8.60s", "~37.95s"], strs
+        # 10 of 20 observed inside the finite buckets: p50's target lands exactly on
+        # the last finite count and interpolates ("~"), p90/p99 exceed it (">")
+        assert tf._quantile_strs({1.0: 5.0, 60.0: 10.0}, 20.0) == ["~60.00s", ">60.00s", ">60.00s"]
 
         # 4) honest gaps: nothing finished, or the server exposes no buckets
         assert tf._quantile_strs(buckets, 0.0) == ["—", "—", "—"]
@@ -192,6 +194,10 @@ if __name__ == "__main__":
 
         lat_row = next(l for l in frame(cur) if "Latency:" in l)
         assert "p99 ~37.95s" in lat_row and "(n=588)" in lat_row, lat_row
+        # TTFT must be wired to its own buckets, not to the latency ones
+        assert sorted(cur["ttft_buckets"]) == [0.5, 1.0, 2.5, 5.0, 10.0, float("inf")]
+        ttft_row = next(l for l in frame(cur) if "TTFT:" in l)
+        assert "p99 ~9.42s" in ttft_row, ttft_row
 
         idle = dict(cur, **{"tensorfold:request_latency_seconds_count": 0.0,
                             "tensorfold:time_to_first_token_seconds_count": 0.0,
