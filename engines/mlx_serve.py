@@ -62,6 +62,9 @@ def mlx_model_info(host, port):
     meta = m.get("meta") or {}
     return {
         "id": m.get("id"),
+        # mlx-serve exposes a human name in `alias` and a hash in `id`; entries
+        # without an alias (e.g. mlx-community/...) have a readable id instead
+        "alias": m.get("alias"),
         "arch": meta.get("architecture"),
         "quant": meta.get("quantization"),
         "ctx": m.get("context_length") or meta.get("context_length") or 0,
@@ -145,8 +148,14 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, rate_hist
     y += 1
     mstate = "loaded" if model.get("loaded", True) else "NOT LOADED"
     mcolor = COLOR_VALUE if model.get("loaded", True) else COLOR_RED
-    draw_row(stdscr, y, x, "", f"{model.get('id') or 'unknown'}  ({mstate})", width, value_color=mcolor)
+    alias = model.get("alias")
+    mod_id = model.get("id")
+    draw_row(stdscr, y, x, "", f"{alias or mod_id or 'unknown'}  ({mstate})", width, value_color=mcolor)
     y += 1
+    if alias and mod_id:
+        # keep the hash reachable without crowding the readable name
+        draw_row(stdscr, y, x, "", f"id {mod_id}", width, value_color=COLOR_DIM)
+        y += 1
     ctx = model.get("ctx") or 0
     detail = " · ".join(v for v in [
         model.get("arch"),

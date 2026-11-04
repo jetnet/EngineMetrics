@@ -59,9 +59,12 @@ if __name__ == "__main__":
         cur = omlx.sample("localhost", 8000)
         render("oMLX :8000", lambda scr: omlx.draw(scr, cur, [cur], "localhost", 8000, 2))
     elif which == "mlx-serve":
-        cur = mlx_serve.sample("localhost", 8000)
-        render("mlx-serve :8000", lambda scr: mlx_serve.draw(
-            scr, cur, None, [cur], time.time() - 60, "localhost", 8000, 2, rate_hist=None))
+        host, port = "localhost", 8000
+        if len(sys.argv) > 3:
+            host, port = sys.argv[2], int(sys.argv[3])
+        cur = mlx_serve.sample(host, port)
+        render("mlx-serve live :%d" % port, lambda scr: mlx_serve.draw(
+            scr, cur, None, [cur], time.time() - 60, host, port, 2, rate_hist=None))
     elif which in ("tensorfold", "tensorfold-synthetic"):
         import engines.tensorfold as tf
         from collections import deque
