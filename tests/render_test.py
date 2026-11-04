@@ -185,7 +185,7 @@ if __name__ == "__main__":
         assert "max safe ctx 96.5K" in next(l for l in rows if "Available:" in l)
         # zero queries must read as an em dash, not a fabricated 0.0%
         q_row = next(l for l in rows if "Query hit rate:" in l)
-        assert "—" in q_row and "0.0%" not in q_row, q_row
+        assert "—" in q_row and "0.0%" not in q_row and "(0/0)" in q_row, q_row
         # an absent restored counter reads n/a and an em dash, not a fake 0.0%
         tok_row = next(l for l in rows if "Token hit rate:" in l)
         assert "—" in tok_row and "n/a" in tok_row, tok_row
@@ -289,6 +289,9 @@ if __name__ == "__main__":
         rows_d = frame(mlx_serve.sample("h", 1))
         tok_d = next(l for l in rows_d if "Token hit rate:" in l)
         assert "—" in tok_d and "%" not in tok_d, tok_d
+        # the counts stay numeric even when the rate is unknowable
+        assert "(5/0 restored)" in tok_d, tok_d
+        assert next(l for l in rows_d if "cache-restored:" in l).rstrip().endswith("/ 5")
         body["metrics"] = metrics_text
 
         # ---- N1/N2: restart clears both windows and drops the stale prev ----
