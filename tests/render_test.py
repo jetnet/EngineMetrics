@@ -451,9 +451,18 @@ if __name__ == "__main__":
             cur = tf.sample(host, port)
             time.sleep(3)
             cur2 = tf.sample(host, port)
+            # resolve the model name the same way tick() does, so the live frame
+            # does not show 'unknown' for engines that only expose it via /v1/models
+            model_name = None
+            ctx_len = None
+            from engines.common import fetch_json as _fj
+            mm = _fj(host, port, "/v1/models")
+            if mm and mm.get("data"):
+                model_name = mm["data"][0].get("id")
+                ctx_len = mm["data"][0].get("context_length")
             render("tensorfold live :%d" % port, lambda scr: tf.draw(
-                scr, cur2, cur, [cur, cur2], time.time() - 60, host, port, 2, None,
-                rate_hist=None, spill_hist=None, spill_cap=128.0))
+                scr, cur2, cur, [cur, cur2], time.time() - 60, host, port, 2, model_name,
+                rate_hist=None, ctx_len=ctx_len, spill_hist=None, spill_cap=128.0))
         else:
             # offline: fabricated sample pair exercising the two-column spill panel
             a = mkt(1000.0)

@@ -21,8 +21,10 @@ def detect_backend(host, port):
     from .common import fetch_json, fetch_metrics
 
     h = fetch_json(host, port, "/health") or {}
-    # TensorFold declares itself
-    if isinstance(h, dict) and h.get("backend"):
+    # TensorFold declares itself. The Zig build reports its hardware backend
+    # there (e.g. "cuda") instead of the engine name, so only accept values
+    # that are actually engine keys and keep probing otherwise.
+    if isinstance(h, dict) and h.get("backend") in ENGINES:
         return h["backend"]
     # oMLX /health: {"status": "healthy", "engine_pool": {...}, ...}
     if isinstance(h, dict) and "engine_pool" in h:
