@@ -5,7 +5,7 @@ Each engine module exposes:
 State dict (owned by the entrypoint): prev, history, rate_hist, start_time, model_name.
 """
 
-from . import mlx_serve, omlx, splash, tensorfold, vllm
+from . import hyperflare, mlx_serve, omlx, splash, tensorfold, vllm
 
 ENGINES = {
     "vllm": vllm,
@@ -13,6 +13,7 @@ ENGINES = {
     "mlx-serve": mlx_serve,
     "omlx": omlx,
     "splash": splash,
+    "hyperflare": hyperflare,
 }
 
 
@@ -40,6 +41,10 @@ def detect_backend(host, port):
     # Splash native engine: splash_* gauges/counters in /metrics
     if any(k.startswith("splash_") for k in m):
         return "splash"
+    # HyperFlare: flare_* counters/gauges in /metrics; its /health is only
+    # {"status": "ok"}, so the metric prefix is the only reliable marker
+    if any(k.startswith("flare_") for k in m):
+        return "hyperflare"
     # oMLX fallback probe (no /metrics): /api/status has models_discovered
     s = fetch_json(host, port, "/api/status")
     if isinstance(s, dict) and "models_discovered" in s:

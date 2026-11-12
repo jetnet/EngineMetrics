@@ -2,7 +2,8 @@
 
 Usage: python3 tests/render_test.py [mlx-robust|omlx|mlx-serve|vllm|vllm-synthetic|tensorfold|
          tensorfold-synthetic|tensorfold-robust|splash|splash-synthetic|
-         splash-fresh|splash-robust] [host [port]]
+         splash-fresh|splash-robust|hyperflare|hyperflare-synthetic|
+         hyperflare-robust] [host [port]]
 """
 import os
 import sys
@@ -17,10 +18,10 @@ curses.color_pair = lambda n: n
 curses.A_BOLD = 0
 
 import engines.mlx_serve as mlx_serve  # noqa: E402
+import engines.hyperflare as hyperflare  # noqa: E402
 import engines.omlx as omlx  # noqa: E402
 import engines.splash as splash  # noqa: E402
 import engines.vllm as vllm  # noqa: E402
-
 
 class FakeScr:
     def __init__(self, w=100):
@@ -800,6 +801,350 @@ if __name__ == "__main__":
             time.sleep(0.2)
             line = next(l for l in scr.buf if "TG live" in l)
             assert "-" not in line, line      # em dash is fine, an ASCII minus is not
+        assert len(state["history"]) == 1, len(state["history"])   # window dropped at restart
+        print("restart: OK")
+    elif which == "hyperflare":
+        # live: two samples 3s apart against the engine, then render with deltas
+        host = sys.argv[2] if len(sys.argv) > 2 else "localhost"
+        port = int(sys.argv[3]) if len(sys.argv) > 3 else 8045
+        cur = hyperflare.sample(host, port)
+        time.sleep(3)
+        cur2 = hyperflare.sample(host, port)
+        models = hyperflare.fetch_json(host, port, "/v1/models") or {}
+        first = (models.get("data") or [{}])[0]
+        render("hyperflare live :%d" % port, lambda scr: hyperflare.draw(
+            scr, cur2, cur, [cur, cur2], time.time() - 60, host, port, 2, first.get("id"),
+            rate_hist=None, ctx_len=first.get("max_model_len"),
+            model_root=first.get("root"), model_meta=first.get("flare")))
+    elif which == "hyperflare-synthetic":
+        # offline: fabricated sample pair exercising every panel with data
+        def mk(t, uptime, gen, prefill, free_pages, free_tokens, checkpoints,
+               lookups, hits, host_lookups, host_hits, spec_rounds, offered, accepted,
+               execs, miss_count):
+            return {
+                "t": t, "_error": None, "uptime_seconds": uptime,
+                "generated_tokens_total": gen, "prefill_tokens_total": prefill,
+                "generated_tokens_last_minute": 1417.0,
+                "active_requests": 3.0, "free_request_slots": 5.0, "pending_requests": 2.0,
+                "retiring_request_slots": 1.0, "upslots": 9.0,
+                "http_inflight_requests": 4.0, "http_request_capacity": 40.0,
+                "total_kv_pages": 8921.0, "free_kv_pages": free_pages,
+                "cached_kv_pages": 41.0, "kv_page_tokens": 256.0,
+                "total_kv_tokens": 2283776.0, "free_kv_tokens": free_tokens,
+                "cached_kv_tokens": 41 * 256.0,
+                "snapshot_capacity": 177.0, "free_snapshots": 89.0, "snapshot_backing_pages": 62.0,
+                "snapshot_publications_total": 88.0, "snapshot_evictions_total": 3.0,
+                "cached_checkpoints": checkpoints,
+                "cache_lookups_total": lookups, "cache_hits_total": hits,
+                "cache_reused_tokens_total": 36486923.0, "cache_misses_total": lookups - hits,
+                "host_cache_lookups_total": host_lookups, "host_cache_hits_total": host_hits,
+                "host_cache_reused_tokens_total": 1298327.0,
+                "host_cache_stored_total": 41.0, "host_cache_store_skipped_total": 9.0,
+                "host_cache_store_failed_total": 1.0, "host_cache_fetched_total": 12.0,
+                "host_cache_fetch_failed_total": 0.0, "host_cache_row_refills_total": 4.0,
+                "host_cache_bytes_out_total": 51.8 * 2 ** 30, "host_cache_bytes_in_total": 0.4 * 2 ** 30,
+                "host_cache_outbound_bytes_per_second": 73400320.0,
+                "host_cache_inbound_bytes_per_second": 4194304.0,
+                "tier_records": {"dram": 63.0, "nvme": 63.0},
+                "tier_bytes": {"dram": 51.8 * 2 ** 30, "nvme": 51.8 * 2 ** 30},
+                "host_cache_parked_records": 2.0, "host_cache_slots_in_use": 63.0,
+                "host_cache_slots_total": 64.0, "host_cache_intake_slots": 8.0,
+                "host_cache_outbound_in_flight": 1.0, "host_cache_inbound_in_flight": 0.0,
+                "host_cache_inbound_waiting": 1.0,
+                "tier_events": {
+                    "held": {"dram": 4.0, "nvme": 2.0}, "dropped": {"dram": 0.0, "nvme": 1.0},
+                    "expired": {"dram": 0.0, "nvme": 0.0}, "thinned": {"dram": 7.0, "nvme": 0.0}},
+                "missing_tokens_buckets": {64.0: 1.0, 256.0: 3.0, 1024.0: 5.0, 4096.0: 7.0,
+                                            16384.0: 8.0, 65536.0: 8.0, 262144.0: 8.0,
+                                            float("inf"): 10.0},
+                "missing_tokens_count": miss_count,
+                "prefill_ns_buckets": {1e5: 0.0, 1e6: 2.0, 1e7: 5.0, 1e8: 7.0, 1e9: 8.0,
+                                       1e10: 8.0, 1e11: 8.0, float("inf"): 9.0},
+                "prefill_ns_count": 9.0,
+                "transfer_ns_buckets": {1e5: 1.0, 1e6: 4.0, 1e7: 7.0, 1e8: 8.0, 1e9: 9.0,
+                                        1e10: 9.0, 1e11: 9.0, float("inf"): 9.0},
+                "transfer_ns_count": 9.0,
+                "captures_by_role": {"anchor": 12.0, "endpoint": 70.0, "message": 6.0},
+                "skips_by_reason": {"storage": 2.0, "unknown_cost": 5.0, "work_budget": 0.0},
+                "checkpoint_extra_work_nanoseconds_total": 41e6,
+                "checkpoint_anchor_reservations": 12.0,
+                "host_cache_abandoned_stores_total": 0.0,
+                "accepted_draft_tokens_total": 70755.0, "draft_request_rounds_total": 144736.0,
+                "verification_draft_tokens_total": 279137.0, "verification_request_rounds_total": 144900.0,
+                "spec_rounds": spec_rounds, "spec_offered": offered, "spec_accepted": accepted,
+                "spec_emitted": accepted + spec_rounds, "spec_gpu_ns": spec_rounds * 40504704.0,
+                "source_offered": {"mtp": offered, "copy": 1200.0},
+                "source_accepted": {"mtp": accepted, "copy": 300.0},
+                "depth_offered": {1: offered * 0.5, 2: offered * 0.3, 3: offered * 0.2},
+                "depth_accepted": {1: accepted * 0.6, 2: accepted * 0.3, 3: accepted * 0.1},
+                "history_drafts_enabled": 1.0, "mixed_grammar_decode_steps_total": 0.0,
+                "reasoning_budget_cuts_total": 2.0,
+                "exec_by_reason": {"ordinary": execs, "acceptance_learning": 41.0,
+                                   "discovery": 3.0, "timing_refresh": 8.0},
+                "exec_ns_by_reason": {"ordinary": execs * 2.4e7, "acceptance_learning": 41 * 5.1e7,
+                                      "discovery": 3 * 9e5, "timing_refresh": 8 * 1.2e6},
+                "replay_gpu_nanoseconds_total": execs * 2.6e7,
+                "replay_readiness_wait_nanoseconds_total": 1.2e8,
+                "graph_by_kind": {"init": 2.0, "restore": 0.0, "resume": 3.0, "prefill": 4.0,
+                                  "decode": 0.0, "vision": 0.0, "snapshot": 88.0,
+                                  "speculative": spec_rounds, "mixed": 0.0},
+                "sampling_by_kind": {"prefill": 4.0, "decode": 0.0, "resume": 0.0,
+                                     "speculative": spec_rounds, "mixed": 0.0},
+                "http_by_api": {"chat": 1.0, "completions": 0.0, "count_tokens": 2.0,
+                                "messages": 3.0, "responses": 0.0},
+                "requests_admitted_total": 318.0, "requests_completed_total": 317.0,
+                "requests_failed_total": 0.0, "requests_cancelled_total": 1.0,
+                "preemptions_total": 0.0,
+                "frontend_active_workers": 2.0, "frontend_worker_capacity": 8.0,
+                "first_response_samples": 318.0, "first_response_capacity": 4096.0,
+                "first_response_window_seconds": 60.0, "first_response_truncated": 0.0,
+                "constrained_max_inflight": 0.0,
+                "decode_weight_bytes": 0.0, "busy": True,
+                "first_response": {"median_seconds": 1.85, "samples": 318.0,
+                                   "window_seconds": 60.0, "capacity": 4096.0, "truncated": 0},
+                "learned_drafter": True, "draft_steps": 12944.0,
+            }
+        a = mk(1000.0, 60.0, 100000.0, 50000.0, 8804.0, 2254592.0, 87.0, 300.0, 240.0,
+               40.0, 12.0, 2100.0, 8400.0, 6300.0, 302.0, 10.0)
+        b = mk(1002.0, 62.0, 100233.0, 50085.0, 8800.0, 2253568.0, 88.0, 302.0, 241.0,
+               41.0, 12.0, 2128.0, 8500.0, 6350.0, 306.0, 10.0)
+        # the window ratios need movement between the two samples
+        b["accepted_draft_tokens_total"] += 420.0
+        b["draft_request_rounds_total"] += 300.0
+        b["verification_draft_tokens_total"] += 620.0
+        b["verification_request_rounds_total"] += 310.0
+        meta = {"max_concurrency": 8, "prefill_chunk_size": 4096, "vocab_size": 154880,
+                "max_top_logprobs": 20, "input_modalities": ["text", "image"],
+                "output_modalities": ["text"], "image_feature_window_tokens": 8192}
+        render("hyperflare synthetic", lambda scr: hyperflare.draw(
+            scr, b, a, [a, b], time.time() - 60, "localhost", 8045, 2, "glm-5.3-flash",
+            rate_hist=None, ctx_len=1048576, model_root="GLM-5.3-Flash-FP4-Local", model_meta=meta))
+    elif which == "hyperflare-robust":
+        # regressions: (1) NaN/Infinity gauges must not reach a rate or a bar and
+        # must not become a fabricated 0; (2) a counter reset (engine restart)
+        # must drop the rate window instead of reporting a negative rate
+        from collections import deque
+        from types import SimpleNamespace
+        hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False: (
+            {"_error": None},
+            {"flare_uptime_seconds": [({}, 10.0)],
+             "flare_generated_tokens_total": [({}, 5.0)],
+             "flare_active_requests": [({}, float("nan"))],
+             "flare_pending_requests": [({}, float("inf"))],
+             "flare_total_kv_pages": [({}, -float("inf"))]},
+            None)
+        # a build without the JSON mirror answers with text: dict lookup yields
+        # None, so the first-response row must state the gap, not show 0ms
+        hyperflare.fetch_json = lambda h, p, path: None
+        cur = hyperflare.sample("localhost", 8045)
+        assert cur["first_response"] is None and cur["learned_drafter"] is None, cur
+        assert "active_requests" not in cur and "pending_requests" not in cur, cur
+        assert "total_kv_pages" not in cur, cur
+        assert cur["busy"] is None, cur["busy"]
+        scr = FakeScr()
+        hyperflare.draw(scr, cur, None, [cur], time.time() - 60, "localhost", 8045, 2,
+                        "glm-5.3-flash", rate_hist=deque())
+        line = next(l for l in scr.buf if "First response" in l)
+        assert "n/a (JSON mirror of /metrics unavailable)" in line, line
+        status = next(l for l in scr.buf if "Status:" in l)
+        assert "n/a" in status, status      # unknown traffic is not "IDLE"
+        requests = next(l for l in scr.buf if "Requests:" in l)
+        assert "admitted n/a" in requests, requests
+        pages = next(l for l in scr.buf if l.strip().startswith("│ Pages:"))
+        assert "n/a / n/a used" in pages, pages
+        print("nan/inf: OK")
+
+        # real text parsing (common.http_get patched, not the parser): labelled
+        # sums, histogram buckets, and aggregate arithmetic must line up
+        import engines.common as _common
+        TEXT = "\n".join([
+            "flare_uptime_seconds 60",
+            "flare_total_kv_pages 100",
+            "flare_free_kv_pages 40",
+            "flare_cached_kv_pages 10",
+            "flare_total_kv_tokens 25600",
+            "flare_free_kv_tokens 10240",
+            "flare_cached_kv_tokens 2560",
+            "flare_kv_page_tokens 256",
+            "flare_cache_lookups_total 8",
+            "flare_cache_hits_total 6",
+            "flare_cache_misses_total 2",
+            "flare_graph_launches_total{kind=\"decode\"} 3",
+            "flare_graph_launches_total{kind=\"prefill\"} 2",
+            "flare_speculative_drafts_total{depth=\"1\",source=\"mtp\",outcome=\"offered\"} 10",
+            "flare_speculative_drafts_total{depth=\"1\",source=\"mtp\",outcome=\"accepted\"} 8",
+            "flare_speculative_drafts_total{depth=\"2\",source=\"mtp\",outcome=\"offered\"} 0",
+            "flare_speculative_drafts_total{depth=\"2\",source=\"mtp\",outcome=\"accepted\"} 0",
+            "flare_host_cache_missing_tokens_bucket{le=\"64\"} 1",
+            "flare_host_cache_missing_tokens_bucket{le=\"256\"} 3",
+            "flare_host_cache_missing_tokens_bucket{le=\"+Inf\"} 4",
+            "flare_host_cache_missing_tokens_count 4",
+        ]) + "\n"
+        hyperflare.fetch_metrics_labeled = _common.fetch_metrics_labeled
+        _common.http_get = lambda url, timeout=5: TEXT
+        parsed = hyperflare.sample("localhost", 8045)
+        assert parsed["total_kv_pages"] == 100.0 and parsed["free_kv_pages"] == 40.0, parsed
+        assert parsed["cache_hits_total"] == 6.0, parsed
+        assert parsed["graph_by_kind"] == {"decode": 3.0, "prefill": 2.0}, parsed["graph_by_kind"]
+        assert parsed["depth_offered"] == {1: 10.0, 2: 0.0}, parsed["depth_offered"]
+        assert parsed["depth_accepted"] == {1: 8.0, 2: 0.0}, parsed["depth_accepted"]
+        assert parsed["missing_tokens_count"] == 4.0, parsed
+        assert parsed["missing_tokens_buckets"] == {64.0: 1.0, 256.0: 3.0, float("inf"): 4.0}, \
+            parsed["missing_tokens_buckets"]
+        later = dict(parsed)
+        later["t"] = parsed["t"] + 2.0
+        scr = FakeScr()
+        hyperflare.draw(scr, later, parsed, [parsed, later], time.time() - 60, "localhost", 8045, 2,
+                        "glm-5.3-flash", rate_hist=deque())
+        pages = next(l for l in scr.buf if l.strip().startswith("│ Pages:"))
+        assert "50 / 100 used" in pages, pages          # 100 - 40 - 10
+        tokens = next(l for l in scr.buf if l.strip().startswith("│ Tokens:"))
+        assert "12.8K / 25.6K" in tokens, tokens        # 25600 - 10240 - 2560
+        gpu = next(l for l in scr.buf if l.strip().startswith("│ GPU:"))
+        assert "hits 75.0%" in gpu, gpu                 # 6 / 8
+        depth_row = next(l for l in scr.buf if "By depth" in l)
+        assert "d1 80.0%" in depth_row and "d2 —" in depth_row, depth_row
+        print("parse: OK")
+
+        # consecutive samples where the counters vanish: the window average must
+        # report a gap, not raise KeyError inside avg_wall_rate(), and must not
+        # invent a rate from a missing endpoint
+        state = {"start_time": time.time(), "prev": None, "history": deque(maxlen=15),
+                 "rate_hist": deque(), "model_name": "glm-5.3-flash"}
+        args = SimpleNamespace(host="localhost", port=8045, interval=2)
+        series_seq = [
+            {"flare_uptime_seconds": 100.0, "flare_generated_tokens_total": 1000.0,
+             "flare_prefill_tokens_total": 500.0},
+            {"flare_uptime_seconds": 104.0},        # counters gone (older build / NaN)
+        ]
+        for series in series_seq:
+            hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, s=series: (
+                {"_error": None}, {k: [({}, v)] for k, v in s.items()}, None)
+            scr = FakeScr()
+            hyperflare.tick(scr, args, state)
+            time.sleep(0.2)
+        assert len(state["history"]) == 2, len(state["history"])
+        prefill_row = next(l for l in scr.buf if "Prefill PP (wall)" in l)
+        assert "— tok/s" in prefill_row and "avg —" in prefill_row, prefill_row
+        print("vanished counters: OK")
+
+        # busy state has three branches, and each must be pinned separately:
+        # any published positive gauge is BUSY even when the others are absent,
+        # a published zero next to absent gauges is unknown (not IDLE), and IDLE
+        # needs every traffic gauge published and zero. Only the all-absent case
+        # was covered before, so a revert to "any published value" slipped past.
+        busy_cases = [
+            ({"flare_active_requests": 2.0}, True, "BUSY"),
+            ({"flare_active_requests": 0.0}, None, "n/a (traffic gauges incomplete)"),
+            ({"flare_active_requests": 0.0, "flare_pending_requests": 0.0,
+              "flare_http_inflight_requests": 0.0}, False, "IDLE"),
+        ]
+        for series, expected, label in busy_cases:
+            hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, s=series: (
+                {"_error": None}, {k: [({}, v)] for k, v in s.items()}, None)
+            sampled = hyperflare.sample("localhost", 8045)
+            assert sampled["busy"] is expected, (series, sampled["busy"])
+            scr = FakeScr()
+            hyperflare.draw(scr, sampled, None, [sampled], time.time() - 60, "localhost", 8045, 2,
+                            "glm-5.3-flash", rate_hist=deque())
+            status = next(l for l in scr.buf if "Status:" in l)
+            assert f"({label})" in status, status
+        print("busy branches: OK")
+
+        # absent -> absent -> present -> present: a counter that reappears must
+        # not manufacture a spike (the previous endpoint is still unknown), and
+        # once both endpoints carry it the rate must be positive, so a frame
+        # that always prints an em dash cannot pass
+        state = {"start_time": time.time(), "prev": None, "history": deque(maxlen=15),
+                 "rate_hist": deque(), "model_name": "glm-5.3-flash"}
+        args = SimpleNamespace(host="localhost", port=8045, interval=2)
+        seq = [
+            {"flare_uptime_seconds": 100.0},
+            {"flare_uptime_seconds": 104.0},
+            {"flare_uptime_seconds": 108.0, "flare_generated_tokens_total": 500.0,
+             "flare_prefill_tokens_total": 200.0},
+            {"flare_uptime_seconds": 112.0, "flare_generated_tokens_total": 900.0,
+             "flare_prefill_tokens_total": 350.0},
+        ]
+        rows = []
+        for series in seq:
+            hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, s=series: (
+                {"_error": None}, {k: [({}, v)] for k, v in s.items()}, None)
+            scr = FakeScr()
+            hyperflare.tick(scr, args, state)
+            rows.append(next(l for l in scr.buf if "Decode TG (wall)" in l))
+            time.sleep(0.2)
+        assert "— tok/s" in rows[0] and "— tok/s" in rows[1], rows[:2]
+        assert "— tok/s" in rows[2], rows[2]     # reappeared, previous endpoint unknown
+
+        def parse_speed(row):
+            token = row.split("Decode TG (wall):")[1].split("tok/s")[0].strip()
+            scale = {"K": 1e3, "M": 1e6, "B": 1e9}.get(token[-1], 1)
+            return float(token.rstrip("KMB")) * scale
+
+        rate = parse_speed(rows[3])
+        assert rate > 0, rows[3]                # 400 tokens over the sample gap
+        print("reappeared counter: OK")
+
+        # model metadata arrives as JSON carried by Python's parser, so NaN and
+        # Infinity are reachable: int() raises on NaN, and neither may render as
+        # a number. Every field must degrade to n/a individually.
+        bad_meta = {"max_concurrency": float("nan"), "prefill_chunk_size": float("inf"),
+                    "vocab_size": 154880.0, "max_top_logprobs": None}
+        scr = FakeScr()
+        hyperflare.draw(scr, {"t": 1000.0, "_error": None, "busy": False}, None,
+                        [{"t": 1000.0}], time.time() - 60, "localhost", 8045, 2, "m",
+                        rate_hist=deque(), model_meta=bad_meta)
+        config = next(l for l in scr.buf if "Config:" in l)
+        assert "max concurrency n/a" in config, config
+        assert "prefill chunk n/a" in config, config
+        assert "vocab 154.9K" in config, config
+        assert "nan" not in config.lower() and "inf" not in config.lower(), config
+        print("metadata: OK")
+
+        # a partial first-response object renders per-field gaps, never
+        # "samples 0/0 over 0s complete"
+        scr = FakeScr()
+        hyperflare.draw(scr, {"t": 1000.0, "_error": None, "busy": False,
+                              "first_response": {}}, None, [{"t": 1000.0}],
+                        time.time() - 60, "localhost", 8045, 2, "m", rate_hist=deque())
+        fr_row = next(l for l in scr.buf if "First response" in l)
+        assert "samples n/a/n/a over n/as" in fr_row, fr_row
+        assert "n/a (not reported)" in fr_row, fr_row
+        # an all-gap window keeps its maximum unknown
+        all_gap = deque([(1000.0, None, None), (1002.0, None, None)])
+        scr = FakeScr()
+        hyperflare.draw(scr, {"t": 1002.0, "_error": None, "busy": False}, None,
+                        [{"t": 1000.0}, {"t": 1002.0}], time.time() - 60, "localhost", 8045, 2,
+                        "m", rate_hist=all_gap)
+        assert any("PP 120s [—]" in l for l in scr.buf), scr.buf
+        # a label family only reports the kinds it carries
+        assert hyperflare._fmt_rate_map({"anchor": 2.0},
+                                        order=("anchor", "endpoint", "message")) == "anchor 2", \
+            hyperflare._fmt_rate_map({"anchor": 2.0}, order=("anchor", "endpoint", "message"))
+        print("partial payloads: OK")
+
+        state = {"start_time": time.time(), "prev": None, "history": deque(maxlen=15),
+                 "rate_hist": deque(), "model_name": "glm-5.3-flash"}
+        args = SimpleNamespace(host="localhost", port=8045, interval=2)
+        for idx, (up, gen) in enumerate([(100.0, 1000.0), (104.0, 1200.0), (2.0, 5.0)]):  # last = restarted
+            hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, u=up, g=gen: (
+                {"_error": None},
+                {"flare_uptime_seconds": [({}, u)],
+                 "flare_generated_tokens_total": [({}, g)],
+                 "flare_prefill_tokens_total": [({}, g / 2)]},
+                None)
+            scr = FakeScr()
+            hyperflare.tick(scr, args, state)
+            time.sleep(0.2)
+            line = next(l for l in scr.buf if "Decode TG (wall)" in l)
+            assert "-" not in line, line      # em dash is fine, an ASCII minus is not
+            if idx == 1:
+                # a growing counter must produce a number, so a frame that always
+                # prints an em dash cannot pass this loop
+                token = line.split("Decode TG (wall):")[1].split("tok/s")[0].strip()
+                scale = {"K": 1e3, "M": 1e6, "B": 1e9}.get(token[-1], 1)
+                assert float(token.rstrip("KMB")) * scale > 0, line
         assert len(state["history"]) == 1, len(state["history"])   # window dropped at restart
         print("restart: OK")
     elif which == "vllm":
