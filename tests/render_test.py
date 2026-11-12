@@ -940,13 +940,93 @@ if __name__ == "__main__":
         assert cur["first_response"] is None and cur["learned_drafter"] is None, cur
         assert "active_requests" not in cur and "pending_requests" not in cur, cur
         assert "total_kv_pages" not in cur, cur
-        assert cur["busy"] is False, cur["busy"]
+        assert cur["busy"] is None, cur["busy"]
         scr = FakeScr()
         hyperflare.draw(scr, cur, None, [cur], time.time() - 60, "localhost", 8045, 2,
                         "glm-5.3-flash", rate_hist=deque())
         line = next(l for l in scr.buf if "First response" in l)
         assert "n/a (JSON mirror of /metrics unavailable)" in line, line
+        status = next(l for l in scr.buf if "Status:" in l)
+        assert "n/a" in status, status      # unknown traffic is not "IDLE"
+        requests = next(l for l in scr.buf if "Requests:" in l)
+        assert "admitted n/a" in requests, requests
+        pages = next(l for l in scr.buf if l.strip().startswith("│ Pages:"))
+        assert "n/a / n/a used" in pages, pages
         print("nan/inf: OK")
+
+        # real text parsing (common.http_get patched, not the parser): labelled
+        # sums, histogram buckets, and aggregate arithmetic must line up
+        import engines.common as _common
+        TEXT = "\n".join([
+            "flare_uptime_seconds 60",
+            "flare_total_kv_pages 100",
+            "flare_free_kv_pages 40",
+            "flare_cached_kv_pages 10",
+            "flare_total_kv_tokens 25600",
+            "flare_free_kv_tokens 10240",
+            "flare_cached_kv_tokens 2560",
+            "flare_kv_page_tokens 256",
+            "flare_cache_lookups_total 8",
+            "flare_cache_hits_total 6",
+            "flare_cache_misses_total 2",
+            "flare_graph_launches_total{kind=\"decode\"} 3",
+            "flare_graph_launches_total{kind=\"prefill\"} 2",
+            "flare_speculative_drafts_total{depth=\"1\",source=\"mtp\",outcome=\"offered\"} 10",
+            "flare_speculative_drafts_total{depth=\"1\",source=\"mtp\",outcome=\"accepted\"} 8",
+            "flare_speculative_drafts_total{depth=\"2\",source=\"mtp\",outcome=\"offered\"} 0",
+            "flare_speculative_drafts_total{depth=\"2\",source=\"mtp\",outcome=\"accepted\"} 0",
+            "flare_host_cache_missing_tokens_bucket{le=\"64\"} 1",
+            "flare_host_cache_missing_tokens_bucket{le=\"256\"} 3",
+            "flare_host_cache_missing_tokens_bucket{le=\"+Inf\"} 4",
+            "flare_host_cache_missing_tokens_count 4",
+        ]) + "\n"
+        hyperflare.fetch_metrics_labeled = _common.fetch_metrics_labeled
+        _common.http_get = lambda url, timeout=5: TEXT
+        parsed = hyperflare.sample("localhost", 8045)
+        assert parsed["total_kv_pages"] == 100.0 and parsed["free_kv_pages"] == 40.0, parsed
+        assert parsed["cache_hits_total"] == 6.0, parsed
+        assert parsed["graph_by_kind"] == {"decode": 3.0, "prefill": 2.0}, parsed["graph_by_kind"]
+        assert parsed["depth_offered"] == {1: 10.0, 2: 0.0}, parsed["depth_offered"]
+        assert parsed["depth_accepted"] == {1: 8.0, 2: 0.0}, parsed["depth_accepted"]
+        assert parsed["missing_tokens_count"] == 4.0, parsed
+        assert parsed["missing_tokens_buckets"] == {64.0: 1.0, 256.0: 3.0, float("inf"): 4.0}, \
+            parsed["missing_tokens_buckets"]
+        later = dict(parsed)
+        later["t"] = parsed["t"] + 2.0
+        scr = FakeScr()
+        hyperflare.draw(scr, later, parsed, [parsed, later], time.time() - 60, "localhost", 8045, 2,
+                        "glm-5.3-flash", rate_hist=deque())
+        pages = next(l for l in scr.buf if l.strip().startswith("│ Pages:"))
+        assert "50 / 100 used" in pages, pages          # 100 - 40 - 10
+        tokens = next(l for l in scr.buf if l.strip().startswith("│ Tokens:"))
+        assert "12.8K / 25.6K" in tokens, tokens        # 25600 - 10240 - 2560
+        gpu = next(l for l in scr.buf if l.strip().startswith("│ GPU:"))
+        assert "hits 75.0%" in gpu, gpu                 # 6 / 8
+        depth_row = next(l for l in scr.buf if "By depth" in l)
+        assert "d1 80.0%" in depth_row and "d2 —" in depth_row, depth_row
+        print("parse: OK")
+
+        # consecutive samples where the counters vanish: the window average must
+        # report a gap, not raise KeyError inside avg_wall_rate(), and must not
+        # invent a rate from a missing endpoint
+        state = {"start_time": time.time(), "prev": None, "history": deque(maxlen=15),
+                 "rate_hist": deque(), "model_name": "glm-5.3-flash"}
+        args = SimpleNamespace(host="localhost", port=8045, interval=2)
+        series_seq = [
+            {"flare_uptime_seconds": 100.0, "flare_generated_tokens_total": 1000.0,
+             "flare_prefill_tokens_total": 500.0},
+            {"flare_uptime_seconds": 104.0},        # counters gone (older build / NaN)
+        ]
+        for series in series_seq:
+            hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, s=series: (
+                {"_error": None}, {k: [({}, v)] for k, v in s.items()}, None)
+            scr = FakeScr()
+            hyperflare.tick(scr, args, state)
+            time.sleep(0.2)
+        assert len(state["history"]) == 2, len(state["history"])
+        prefill_row = next(l for l in scr.buf if "Prefill PP (wall)" in l)
+        assert "— tok/s" in prefill_row and "avg —" in prefill_row, prefill_row
+        print("vanished counters: OK")
 
         state = {"start_time": time.time(), "prev": None, "history": deque(maxlen=15),
                  "rate_hist": deque(), "model_name": "glm-5.3-flash"}

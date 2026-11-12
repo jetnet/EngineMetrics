@@ -310,9 +310,11 @@ delta-sampled between polls:
 ## How the HyperFlare numbers are derived
 
 HyperFlare (NVIDIA/hyperflare-inference) publishes Prometheus text at `/metrics`;
-its `/health` is just `{"status": "ok"}`. One scrape per poll plus a one-off
-`/v1/models` read fills every panel. Its counters are **cumulative**, so live
-rates are delta-sampled between polls, and an engine restart (uptime going
+its `/health` is just `{"status": "ok"}`. Each poll reads two forms of the same
+metrics route — the Prometheus text (labelled families) and its JSON mirror
+(`?format=json`, which alone carries the first-response median and the drafter
+flags) — plus a one-off `/v1/models` read. Its counters are **cumulative**, so
+live rates are delta-sampled between polls, and an engine restart (uptime going
 backwards) drops the window instead of reporting a negative rate:
 
 - **PP (wall)** = Δ`flare_prefill_tokens_total` / Δwall — prompt tokens consumed

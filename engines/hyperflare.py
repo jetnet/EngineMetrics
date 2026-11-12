@@ -1,10 +1,13 @@
 """HyperFlare backend: flare_* Prometheus counters and gauges.
 
-The engine publishes no JSON telemetry — /health is just {"status": "ok"} — so a
-sample is one /metrics scrape plus a one-off /v1/models read for the model card.
-Every token and byte counter is cumulative, so live throughput comes from
-delta-sampling between polls. When the engine restarts, counters go backwards:
-the rate window is dropped rather than turned into a negative rate.
+The engine publishes no device or props endpoint — /health is just
+{"status": "ok"} — so one poll reads two forms of the same metrics route: the
+Prometheus text (labelled families) and its JSON mirror (?format=json), which
+alone carries the 60-second first-response median and the drafter booleans.
+/v1/models is read once for the model card. Every token and byte counter is
+cumulative, so live throughput comes from delta-sampling between polls. When the
+engine restarts, counters go backwards: the rate window is dropped rather than
+turned into a negative rate.
 
 Metric meanings below quote the HELP text the engine publishes; anything the
 engine does not publish renders as an explicit gap, never as a fabricated zero.
@@ -69,7 +72,11 @@ def _scalars(series):
 
 
 def _sum(series, base, **match):
-    """Sum of one series family, optionally restricted to label values."""
+    """Sum of one series family, optionally restricted to label values.
+
+    None when the family is absent: a missing counter is an unknown total, not
+    a zero total, so callers must render a gap.
+    """
     total, seen = 0.0, False
     for labels, value in series.get(base, []):
         if any(labels.get(k) != v for k, v in match.items()):
@@ -79,7 +86,7 @@ def _sum(series, base, **match):
             continue
         total += f
         seen = True
-    return total if seen else 0.0
+    return total if seen else None
 
 
 def _by(series, base, label):
@@ -100,7 +107,9 @@ def _buckets(series, base):
     """{upper_bound: cumulative_count} for one histogram.
 
     Several label sets for the same histogram yield {} (percentiles then render
-    as em dashes) instead of silently mixing unrelated series.
+    as em dashes) instead of silently mixing unrelated series. A bound that is
+    not a usable number (NaN, negative infinity) makes the histogram unusable
+    too: interpolation over it would emit a non-finite percentile.
     """
     out = {}
     for labels, value in series.get(base + "_bucket", []):
@@ -110,6 +119,8 @@ def _buckets(series, base):
             continue
         if count != count or abs(count) == float("inf"):
             continue
+        if bound != bound or bound == -float("inf"):
+            continue
         if bound in out:
             return {}
         out[bound] = count
@@ -117,7 +128,11 @@ def _buckets(series, base):
 
 
 def _pct(num, den):
-    return None if not den else num / den * 100.0
+    """Percentage of a denominator, None when either side is unknown or the
+    denominator is zero (an absent measurement is not a 0% rate)."""
+    if num is None or not den:
+        return None
+    return num / den * 100.0
 
 
 def _pct_txt(num, den, digits=1):
@@ -128,7 +143,40 @@ def _pct_txt(num, den, digits=1):
 def _share_txt(num, den, digits=1):
     """Share of a label group that the engine saw at all: an em dash when the
     denominator is zero, because 0/0 is an absent measurement, not a 0% rate."""
-    return "—" if not den else f"{num / den * 100.0:.{digits}f}%"
+    if num is None or not den:
+        return "—"
+    return f"{num / den * 100.0:.{digits}f}%"
+
+
+def _cnt(cur, key, fmt=format_num):
+    """Formatted measurement, or 'n/a' when the engine did not publish it."""
+    return _num_txt(cur.get(key), fmt)
+
+
+def _num_txt(value, fmt=format_num):
+    """Formatted derived value, or 'n/a' when a required input was missing."""
+    return "n/a" if value is None else fmt(value)
+
+
+def _int(cur, key):
+    """Whole-number measurement, or 'n/a' when the engine did not publish it."""
+    value = cur.get(key)
+    return "n/a" if value is None else str(int(value))
+
+
+def _bytes_txt(cur, key):
+    return _cnt(cur, key, format_bytes)
+
+
+def _rate_txt(cur, key):
+    """A measured per-second gauge, e.g. '4.2M/s', or 'n/a'."""
+    value = cur.get(key)
+    return "n/a" if value is None else format_bytes(value) + "/s"
+
+
+def _secs_txt(cur, key):
+    value = cur.get(key)
+    return "n/a" if value is None else f"{value / 1e9:.2f}s"
 
 
 def _ms_from_ns(ns):
@@ -188,12 +236,12 @@ def sample(host, port):
     s["captures_by_role"] = _by(series, PREFIX + "checkpoint_captures_total", "role")
     s["skips_by_reason"] = _by(series, PREFIX + "checkpoint_skips_total", "reason")
     s["tier_records"] = {
-        "dram": s.get("host_cache_memory_records", 0.0),
-        "nvme": s.get("host_cache_disk_records", 0.0),
+        "dram": s.get("host_cache_memory_records"),
+        "nvme": s.get("host_cache_disk_records"),
     }
     s["tier_bytes"] = {
-        "dram": s.get("host_cache_memory_bytes", 0.0),
-        "nvme": s.get("host_cache_disk_bytes", 0.0),
+        "dram": s.get("host_cache_memory_bytes"),
+        "nvme": s.get("host_cache_disk_bytes"),
     }
     s["tier_events"] = {
         "held": _by(series, PREFIX + "host_cache_held_total", "tier"),
@@ -205,11 +253,18 @@ def sample(host, port):
     # Histograms + their observation counts (the `_count` scalars)
     for short, base in HOST_HISTOGRAMS.items():
         s[short + "_buckets"] = _buckets(series, PREFIX + base)
-        s[short + "_count"] = s.get(base + "_count", 0.0)
+        s[short + "_count"] = s.get(base + "_count")
 
-    s["upslots"] = s.get("active_requests", 0.0) + s.get("free_request_slots", 0.0) + s.get("retiring_request_slots", 0.0)
-    s["busy"] = bool(s.get("active_requests", 0.0) > 0 or s.get("pending_requests", 0.0) > 0
-                     or s.get("http_inflight_requests", 0.0) > 0)
+    # Slot occupancy: a total derived from three gauges is only known when all
+    # three are published, and busy state is only known when any of the traffic
+    # gauges is.
+    active, free_slots, retiring = (s.get("active_requests"), s.get("free_request_slots"),
+                                    s.get("retiring_request_slots"))
+    s["upslots"] = (None if None in (active, free_slots, retiring)
+                    else active + free_slots + retiring)
+    traffic = [s.get("active_requests"), s.get("pending_requests"), s.get("http_inflight_requests")]
+    known_traffic = [v for v in traffic if v is not None]
+    s["busy"] = any(v > 0 for v in known_traffic) if known_traffic else None
 
     # JSON mirror of the same route. A build without the JSON form answers with
     # the text exposition instead (not a dict), so every field here stays None
@@ -255,11 +310,17 @@ def tick(stdscr, args, state):
 
 
 def _fmt_tier_events(events):
-    """'held 0 · dropped 0 · expired 0 · thinned 0' with dram/nvme split only
-    when a tier actually counted something."""
+    """'held 0 · dropped 0 · expired 0 · thinned 0' with a dram/nvme split when
+    a tier counted something. An empty map set means the engine published no
+    tier families at all, which is a gap rather than four zeros."""
+    if not any(events.get(name) for name in ("held", "dropped", "expired", "thinned")):
+        return "n/a (not reported)"
     parts = []
     for name in ("held", "dropped", "expired", "thinned"):
         by_tier = events.get(name) or {}
+        if not by_tier:
+            parts.append(f"{name} n/a")
+            continue
         total = sum(by_tier.values())
         if total and len([v for v in by_tier.values() if v]):
             split = " ".join(f"{tier} {format_num(v)}" for tier, v in sorted(by_tier.items()))
@@ -272,7 +333,11 @@ def _fmt_tier_events(events):
 def _fmt_rate_map(mapping, order=None, fmt=None):
     """'a 1 · b 2' sorted by value (descending), zero entries kept so a missing
     kind is visible instead of vanishing. A fixed `order` puts the known kinds
-    first and still appends any kind the engine added later."""
+    first and still appends any kind the engine added later. An absent family
+    renders as 'n/a' — its kinds were never reported, so listing them as zeros
+    would invent four counters."""
+    if not mapping:
+        return "n/a (not reported)"
     fmt = fmt or (lambda v: format_num(v))
     ranked = [k for k, _ in sorted(mapping.items(), key=lambda kv: (-kv[1], kv[0]))]
     keys = list(order or [])
@@ -282,10 +347,22 @@ def _fmt_rate_map(mapping, order=None, fmt=None):
 
 def _window_delta(history, key):
     """Change of one counter across the sampling window (newest sample is
-    history[-1]); None while the window holds fewer than two samples."""
+    history[-1]); None while the window holds fewer than two samples or either
+    endpoint did not publish the counter."""
     if not history or len(history) < 2:
         return None
-    return history[-1].get(key, 0.0) - history[0].get(key, 0.0)
+    if key not in history[0] or key not in history[-1]:
+        return None
+    return history[-1][key] - history[0][key]
+
+
+def _avg_wall(history, key):
+    """Window-average wall rate. avg_wall_rate() indexes the sample dicts
+    directly, so a counter missing at either endpoint must be rejected here
+    instead of raising KeyError inside the draw loop."""
+    if len(history) < 2 or key not in history[0] or key not in history[-1]:
+        return None
+    return avg_wall_rate(history, key)
 
 
 def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_name,
@@ -319,8 +396,12 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
         stdscr.refresh()
         return
     y += 1
-    status = "BUSY" if cur["busy"] else "IDLE"
-    scolor = COLOR_WARN if cur["busy"] else COLOR_GREEN
+    if cur["busy"] is None:
+        status, scolor = "n/a (no traffic gauge published)", COLOR_DIM
+    elif cur["busy"]:
+        status, scolor = "BUSY", COLOR_WARN
+    else:
+        status, scolor = "IDLE", COLOR_GREEN
     engine_up = cur.get("uptime_seconds")
     up_txt = f"   engine up {format_uptime(engine_up)}" if engine_up else ""
     try:
@@ -332,8 +413,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     # ---- Live throughput ----
     pp_live = wall_rate_safe(cur, prev, "prefill_tokens_total")
     tg_live = wall_rate_safe(cur, prev, "generated_tokens_total")
-    pp_avg = avg_wall_rate(history, "prefill_tokens_total")
-    tg_avg = avg_wall_rate(history, "generated_tokens_total")
+    pp_avg = _avg_wall(history, "prefill_tokens_total")
+    tg_avg = _avg_wall(history, "generated_tokens_total")
     if rate_hist is not None:
         append_rate_sample(rate_hist, cur["t"], pp_live, tg_live, min_gap=interval * 0.9)
 
@@ -355,10 +436,10 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
                  f"{format_speed(last_min / 60.0)} tok/s   ({format_num(last_min)} tok in the last minute)", width)
     y += 1
     draw_row(stdscr, y, x, "Slots:",
-             f"active {int(cur.get('active_requests', 0))}  free {int(cur.get('free_request_slots', 0))}  "
-             f"pending {int(cur.get('pending_requests', 0))}  retiring {int(cur.get('retiring_request_slots', 0))}"
-             f"  / {int(cur['upslots'])}   HTTP inflight {int(cur.get('http_inflight_requests', 0))}"
-             f"/{int(cur.get('http_request_capacity', 0))}", width)
+             f"active {_int(cur, 'active_requests')}  free {_int(cur, 'free_request_slots')}  "
+             f"pending {_int(cur, 'pending_requests')}  retiring {_int(cur, 'retiring_request_slots')}"
+             f"  / {_int(cur, 'upslots')}   HTTP inflight {_int(cur, 'http_inflight_requests')}"
+             f"/{_int(cur, 'http_request_capacity')}", width)
     y += 1
     # Server-side time from HTTP admission to the first offered answer or
     # reasoning text, over a 60-second window (JSON mirror of /metrics only).
@@ -396,44 +477,47 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     # HELP: total_kv_pages counts the per-rank pool BEFORE checkpoint retention,
     # free_kv_pages is reusable after completed fences, cached_kv_pages is owned
     # by immutable checkpoints. In-use pages are therefore total - free - cached.
-    total_pages = cur.get("total_kv_pages", 0.0)
-    free_pages = cur.get("free_kv_pages", 0.0)
-    cached_pages = cur.get("cached_kv_pages", 0.0)
-    used_pages = max(total_pages - free_pages - cached_pages, 0.0)
-    total_tokens = cur.get("total_kv_tokens", 0.0)
-    free_tokens = cur.get("free_kv_tokens", 0.0)
-    cached_tokens = cur.get("cached_kv_tokens", 0.0)
-    used_tokens = max(total_tokens - free_tokens - cached_tokens, 0.0)
+    total_pages = cur.get("total_kv_pages")
+    free_pages = cur.get("free_kv_pages")
+    cached_pages = cur.get("cached_kv_pages")
+    used_pages = (None if None in (total_pages, free_pages, cached_pages)
+                  else max(total_pages - free_pages - cached_pages, 0.0))
+    total_tokens = cur.get("total_kv_tokens")
+    free_tokens = cur.get("free_kv_tokens")
+    cached_tokens = cur.get("cached_kv_tokens")
+    used_tokens = (None if None in (total_tokens, free_tokens, cached_tokens)
+                   else max(total_tokens - free_tokens - cached_tokens, 0.0))
     used_pct = _pct(used_pages, total_pages) or 0.0
     cached_pct = _pct(cached_pages, total_pages) or 0.0
     kv_color = COLOR_GREEN if used_pct < 70 else COLOR_WARN if used_pct < 90 else COLOR_RED
 
     draw_box_start(stdscr, y, x, width, "KV pool")
     y += 1
-    if total_pages > 0:
+    if total_pages and used_pages is not None:
         draw_bar_row(stdscr, y, x, "KV pages in use:", used_pct, width, kv_color)
         y += 1
         draw_bar_row(stdscr, y, x, "Checkpoint pages:", cached_pct, width, COLOR_HEADER)
         y += 1
     else:
-        draw_row(stdscr, y, x, "KV pages:", "n/a (engine reports no KV page pool)", width,
+        draw_row(stdscr, y, x, "KV pages:", "n/a (engine reports no usable KV page gauges)", width,
                  value_color=COLOR_DIM)
         y += 1
     draw_row(stdscr, y, x, "Pages:",
-             f"{format_num(used_pages)} / {format_num(total_pages)} used   free {format_num(free_pages)}"
-             f"   {format_num(cur.get('kv_page_tokens', 0))} tok/page", width)
+             f"{_num_txt(used_pages)} / {_cnt(cur, 'total_kv_pages')} used"
+             f"   free {_cnt(cur, 'free_kv_pages')}"
+             f"   {_cnt(cur, 'kv_page_tokens')} tok/page", width)
     y += 1
     draw_row(stdscr, y, x, "Tokens:",
-             f"{format_num(used_tokens)} / {format_num(total_tokens)}   free {format_num(free_tokens)}"
-             f"   cached {format_num(cached_tokens)}", width)
+             f"{_num_txt(used_tokens)} / {_cnt(cur, 'total_kv_tokens')}"
+             f"   free {_cnt(cur, 'free_kv_tokens')}"
+             f"   cached {_cnt(cur, 'cached_kv_tokens')}", width)
     y += 1
-    snap_cap = cur.get("snapshot_capacity", 0.0)
-    snap_free = cur.get("free_snapshots", 0.0)
     draw_row(stdscr, y, x, "Snapshots:",
-             f"{format_num(snap_free)} / {format_num(snap_cap)} free   backing {format_num(cur.get('snapshot_backing_pages', 0))} pages"
-             f"   published {format_num(cur.get('snapshot_publications_total', 0))}"
-             f"   evictions {format_num(cur.get('snapshot_evictions_total', 0))}"
-             f"   checkpoints {format_num(cur.get('cached_checkpoints', 0))}", width)
+             f"{_cnt(cur, 'free_snapshots')} / {_cnt(cur, 'snapshot_capacity')} free"
+             f"   backing {_cnt(cur, 'snapshot_backing_pages')} pages"
+             f"   published {_cnt(cur, 'snapshot_publications_total')}"
+             f"   evictions {_cnt(cur, 'snapshot_evictions_total')}"
+             f"   checkpoints {_cnt(cur, 'cached_checkpoints')}", width)
     y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
@@ -441,58 +525,59 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     # ---- Prefix cache ----
     draw_box_start(stdscr, y, x, width, "Prefix cache")
     y += 1
-    gpu_lookups = cur.get("cache_lookups_total", 0.0)
-    gpu_hits = cur.get("cache_hits_total", 0.0)
+    gpu_lookups = cur.get("cache_lookups_total")
+    gpu_hits = cur.get("cache_hits_total")
     draw_row(stdscr, y, x, "GPU:",
-             f"lookups {format_num(gpu_lookups)}   hits {_pct_txt(gpu_hits, gpu_lookups)}"
-             f"   reused {format_num(cur.get('cache_reused_tokens_total', 0))} tok"
-             f"   misses {format_num(cur.get('cache_misses_total', 0))}", width)
+             f"lookups {_cnt(cur, 'cache_lookups_total')}   hits {_pct_txt(gpu_hits, gpu_lookups)}"
+             f"   reused {_cnt(cur, 'cache_reused_tokens_total')} tok"
+             f"   misses {_cnt(cur, 'cache_misses_total')}", width)
     y += 1
-    host_lookups = cur.get("host_cache_lookups_total", 0.0)
-    host_hits = cur.get("host_cache_hits_total", 0.0)
+    host_lookups = cur.get("host_cache_lookups_total")
+    host_hits = cur.get("host_cache_hits_total")
     draw_row(stdscr, y, x, "Host store:",
-             f"lookups {format_num(host_lookups)}   hits {_pct_txt(host_hits, host_lookups)}"
-             f"   reused {format_num(cur.get('host_cache_reused_tokens_total', 0))} tok", width)
+             f"lookups {_cnt(cur, 'host_cache_lookups_total')}"
+             f"   hits {_pct_txt(host_hits, host_lookups)}"
+             f"   reused {_cnt(cur, 'host_cache_reused_tokens_total')} tok", width)
     y += 1
     draw_row(stdscr, y, x, "Store:",
-             f"stored {format_num(cur.get('host_cache_stored_total', 0))}"
-             f"  skipped {format_num(cur.get('host_cache_store_skipped_total', 0))} (duplicates/retries)"
-             f"  failed {format_num(cur.get('host_cache_store_failed_total', 0))}"
-             f"   ·   fetched {format_num(cur.get('host_cache_fetched_total', 0))}"
-             f"  failed {format_num(cur.get('host_cache_fetch_failed_total', 0))}"
-             f"  refills {format_num(cur.get('host_cache_row_refills_total', 0))}", width)
+             f"stored {_cnt(cur, 'host_cache_stored_total')}"
+             f"  skipped {_cnt(cur, 'host_cache_store_skipped_total')} (duplicates/retries)"
+             f"  failed {_cnt(cur, 'host_cache_store_failed_total')}"
+             f"   ·   fetched {_cnt(cur, 'host_cache_fetched_total')}"
+             f"  failed {_cnt(cur, 'host_cache_fetch_failed_total')}"
+             f"  refills {_cnt(cur, 'host_cache_row_refills_total')}", width)
     y += 1
-    out_b = cur.get("host_cache_bytes_out_total", 0.0)
-    in_b = cur.get("host_cache_bytes_in_total", 0.0)
     draw_two_col_row(stdscr, y, x, width, "Copied out:",
-                     f"{format_bytes(out_b)} · {format_bytes(cur.get('host_cache_outbound_bytes_per_second', 0))}/s",
+                     f"{_bytes_txt(cur, 'host_cache_bytes_out_total')}"
+                     f" · {_rate_txt(cur, 'host_cache_outbound_bytes_per_second')}",
                      "Copied in:",
-                     f"{format_bytes(in_b)} · {format_bytes(cur.get('host_cache_inbound_bytes_per_second', 0))}/s")
+                     f"{_bytes_txt(cur, 'host_cache_bytes_in_total')}"
+                     f" · {_rate_txt(cur, 'host_cache_inbound_bytes_per_second')}")
     y += 1
     records = cur.get("tier_records", {})
     tier_bytes = cur.get("tier_bytes", {})
     draw_row(stdscr, y, x, "Resident:",
-             f"DRAM {format_num(records.get('dram', 0))} rec / {format_bytes(tier_bytes.get('dram', 0))}"
-             f"   NVMe {format_num(records.get('nvme', 0))} rec / {format_bytes(tier_bytes.get('nvme', 0))}"
-             f"   parked {format_num(cur.get('host_cache_parked_records', 0))}"
-             f"   slots {format_num(cur.get('host_cache_slots_in_use', 0))}/{format_num(cur.get('host_cache_slots_total', 0))}"
-             f" (intake {format_num(cur.get('host_cache_intake_slots', 0))})"
-             f"   inflight out {format_num(cur.get('host_cache_outbound_in_flight', 0))}"
-             f" in {format_num(cur.get('host_cache_inbound_in_flight', 0))}"
-             f" waiting {format_num(cur.get('host_cache_inbound_waiting', 0))}", width)
+             f"DRAM {_num_txt(records.get('dram'))} rec / {_num_txt(tier_bytes.get('dram'), format_bytes)}"
+             f"   NVMe {_num_txt(records.get('nvme'))} rec / {_num_txt(tier_bytes.get('nvme'), format_bytes)}"
+             f"   parked {_cnt(cur, 'host_cache_parked_records')}"
+             f"   slots {_cnt(cur, 'host_cache_slots_in_use')}/{_cnt(cur, 'host_cache_slots_total')}"
+             f" (intake {_cnt(cur, 'host_cache_intake_slots')})"
+             f"   inflight out {_cnt(cur, 'host_cache_outbound_in_flight')}"
+             f" in {_cnt(cur, 'host_cache_inbound_in_flight')}"
+             f" waiting {_cnt(cur, 'host_cache_inbound_waiting')}", width)
     y += 1
     draw_row(stdscr, y, x, "Tier events:", _fmt_tier_events(cur.get("tier_events", {})), width)
     y += 1
-    miss_q = quantile_strs(cur.get("missing_tokens_buckets"), cur.get("missing_tokens_count", 0.0),
+    miss_q = quantile_strs(cur.get("missing_tokens_buckets"), cur.get("missing_tokens_count") or 0.0,
                            fmt=format_num)
     draw_row(stdscr, y, x, "Missing tokens:",
              f"p50 {miss_q[0]}  p90 {miss_q[1]}  p99 {miss_q[2]}"
-             f"   (n={format_num(cur.get('missing_tokens_count', 0))})", width)
+             f"   (n={_cnt(cur, 'missing_tokens_count')})", width)
     y += 1
     # Bounds are nanoseconds; the formatter converts them to ms/s for display.
-    pre_q = quantile_strs(cur.get("prefill_ns_buckets"), cur.get("prefill_ns_count", 0.0),
+    pre_q = quantile_strs(cur.get("prefill_ns_buckets"), cur.get("prefill_ns_count") or 0.0,
                           fmt=lambda ns: format_latency(ns / 1e9))
-    xfer_q = quantile_strs(cur.get("transfer_ns_buckets"), cur.get("transfer_ns_count", 0.0),
+    xfer_q = quantile_strs(cur.get("transfer_ns_buckets"), cur.get("transfer_ns_count") or 0.0,
                            fmt=lambda ns: format_latency(ns / 1e9))
     draw_row(stdscr, y, x, "Est. prefill / transfer:",
              f"p50 {pre_q[0]} / {xfer_q[0]}   p90 {pre_q[1]} / {xfer_q[1]}"
@@ -506,11 +591,12 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
                      "rejected:",
                      _fmt_rate_map(skips, order=("storage", "unknown_cost", "work_budget")))
     y += 1
-    extra_work = cur.get("checkpoint_extra_work_nanoseconds_total", 0.0) / 1e9
+    extra_ns = cur.get("checkpoint_extra_work_nanoseconds_total")
     draw_row(stdscr, y, x, "Checkpoint overhead:",
-             f"{format_latency(extra_work)} charged extra work (predicted, not a GPU measurement)"
-             f"   ·   {format_num(cur.get('checkpoint_anchor_reservations', 0))} unused anchor guards"
-             f"   ·   abandoned stores {format_num(cur.get('host_cache_abandoned_stores_total', 0))}", width)
+             f"{_num_txt(None if extra_ns is None else extra_ns / 1e9, format_latency)}"
+             f" charged extra work (predicted, not a GPU measurement)"
+             f"   ·   {_cnt(cur, 'checkpoint_anchor_reservations')} unused anchor guards"
+             f"   ·   abandoned stores {_cnt(cur, 'host_cache_abandoned_stores_total')}", width)
     y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
@@ -521,10 +607,6 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     # acceptance length is 1 + accepted drafts per such round.
     draw_box_start(stdscr, y, x, width, "Speculative decode")
     y += 1
-    acc_tok = cur.get("accepted_draft_tokens_total", 0.0)
-    req_rounds = cur.get("draft_request_rounds_total", 0.0)
-    ver_tok = cur.get("verification_draft_tokens_total", 0.0)
-    ver_rounds = cur.get("verification_request_rounds_total", 0.0)
     # Both headline numbers are window deltas, as the engine's own dashboard
     # defines them: DEPTH is the change in verification_drafts over the change
     # in verification_rounds, and the mean acceptance length is 1 + accepted
@@ -543,30 +625,33 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
              f"mean {mean_txt}   planned verification {depth_txt}", width, value_color=acc_color)
     y += 1
     draw_row(stdscr, y, x, "Draft rounds:",
-             f"{format_num(req_rounds)} offering drafts   {format_num(ver_rounds)} decode/verification"
-             f"   {format_num(acc_tok)} accepted   {format_num(ver_tok)} allocated", width)
+             f"{_cnt(cur, 'draft_request_rounds_total')} offering drafts"
+             f"   {_cnt(cur, 'verification_request_rounds_total')} decode/verification"
+             f"   {_cnt(cur, 'accepted_draft_tokens_total')} accepted"
+             f"   {_cnt(cur, 'verification_draft_tokens_total')} allocated", width)
     y += 1
-    spec_rounds = cur.get("spec_rounds", 0.0)
+    spec_rounds = cur.get("spec_rounds")
     gpu_ms = _ms_from_ns(cur.get("spec_gpu_ns"))
     per_round = gpu_ms / spec_rounds if spec_rounds and gpu_ms is not None else None
     per_round_txt = "n/a" if per_round is None else f"{per_round:.1f} ms/round"
     draw_row(stdscr, y, x, "Spec records:",
-             f"rounds {format_num(spec_rounds)}   offered {format_num(cur.get('spec_offered', 0))}"
-             f"   accepted {format_num(cur.get('spec_accepted', 0))}"
-             f" ({_pct_txt(cur.get('spec_accepted', 0), cur.get('spec_offered', 0))})"
-             f"   emitted {format_num(cur.get('spec_emitted', 0))} tok"
+             f"rounds {_cnt(cur, 'spec_rounds')}"
+             f"   offered {_cnt(cur, 'spec_offered')}"
+             f"   accepted {_cnt(cur, 'spec_accepted')}"
+             f" ({_share_txt(cur.get('spec_accepted'), cur.get('spec_offered'))})"
+             f"   emitted {_cnt(cur, 'spec_emitted')} tok"
              f"   GPU {per_round_txt}", width)
     y += 1
     src_off, src_acc = cur.get("source_offered", {}), cur.get("source_accepted", {})
     src_parts = []
     for source in sorted(set(src_off) | set(src_acc)):
-        src_parts.append(f"{source} {_share_txt(src_acc.get(source, 0.0), src_off.get(source, 0.0))}"
-                         f" ({format_num(src_acc.get(source, 0.0))}/{format_num(src_off.get(source, 0.0))})")
+        src_parts.append(f"{source} {_share_txt(src_acc.get(source), src_off.get(source))}"
+                         f" ({_num_txt(src_acc.get(source))}/{_num_txt(src_off.get(source))})")
     draw_row(stdscr, y, x, "By source:", "   ".join(src_parts) or "n/a (no draft outcomes yet)", width,
              value_color=COLOR_VALUE if src_parts else COLOR_DIM)
     y += 1
     d_off, d_acc = cur.get("depth_offered", {}), cur.get("depth_accepted", {})
-    depth_parts = [f"d{d} {_share_txt(d_acc.get(d, 0.0), d_off.get(d, 0.0))}" for d in sorted(set(d_off) | set(d_acc))]
+    depth_parts = [f"d{d} {_share_txt(d_acc.get(d), d_off.get(d))}" for d in sorted(set(d_off) | set(d_acc))]
     draw_row(stdscr, y, x, "By depth:", "   ".join(depth_parts) or "n/a (no drafts yet)", width,
              value_color=COLOR_VALUE if depth_parts else COLOR_DIM)
     y += 1
@@ -578,8 +663,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     steps_txt = "n/a" if draft_steps is None else format_num(draft_steps)
     draw_row(stdscr, y, x, "Drafters:",
              f"learned {learned_txt}   draft steps {steps_txt}   history {hist_txt}"
-             f"   ·   mixed grammar steps {format_num(cur.get('mixed_grammar_decode_steps_total', 0))}"
-             f"   reasoning cuts {format_num(cur.get('reasoning_budget_cuts_total', 0))}", width)
+             f"   ·   mixed grammar steps {_cnt(cur, 'mixed_grammar_decode_steps_total')}"
+             f"   reasoning cuts {_cnt(cur, 'reasoning_budget_cuts_total')}", width)
     y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
@@ -587,46 +672,47 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     # ---- Scheduler & graphs ----
     draw_box_start(stdscr, y, x, width, "Scheduler & graphs")
     y += 1
-    exec_by_reason = cur.get("exec_by_reason", {})
-    exec_total = sum(exec_by_reason.values())
-    replay_s = cur.get("replay_gpu_nanoseconds_total", 0.0) / 1e9
-    replay_per = replay_s / exec_total * 1000 if exec_total else None
+    exec_by_reason = cur.get("exec_by_reason") or {}
+    exec_total = sum(exec_by_reason.values()) if exec_by_reason else None
+    replay_ns = cur.get("replay_gpu_nanoseconds_total")
+    replay_per = (replay_ns / 1e6 / exec_total) if replay_ns is not None and exec_total else None
+    replay_txt = "n/a" if replay_ns is None else f"{replay_ns / 1e9:.1f}s"
     draw_row(stdscr, y, x, "Executions:",
-             f"{format_num(exec_total)}   GPU replay {replay_s:.1f}s"
+             f"{_num_txt(exec_total)}   GPU replay {replay_txt}"
              f"   {('n/a' if replay_per is None else f'{replay_per:.2f} ms')} / execution"
-             f"   readiness waits {cur.get('replay_readiness_wait_nanoseconds_total', 0.0) / 1e9:.2f}s", width)
+             f"   readiness waits {_secs_txt(cur, 'replay_readiness_wait_nanoseconds_total')}", width)
     y += 1
-    ns_by_reason = cur.get("exec_ns_by_reason", {})
+    ns_by_reason = cur.get("exec_ns_by_reason") or {}
     reason_parts = []
     for reason, count in sorted(exec_by_reason.items(), key=lambda kv: (-kv[1], kv[0])):
-        ns = ns_by_reason.get(reason, 0.0)
-        reason_parts.append(f"{reason} {ns / count / 1e6:.1f} ms" if count else f"{reason} n/a")
+        ns = ns_by_reason.get(reason)
+        if not count or ns is None:
+            reason_parts.append(f"{reason} n/a")
+        else:
+            reason_parts.append(f"{reason} {ns / count / 1e6:.1f} ms")
     draw_row(stdscr, y, x, "Per execution:",
              "   ".join(reason_parts) or "n/a (no executions yet)", width,
              value_color=COLOR_VALUE if reason_parts else COLOR_DIM)
     y += 1
-    graph_by_kind = cur.get("graph_by_kind", {})
-    draw_row(stdscr, y, x, "Graph launches:", _fmt_rate_map(graph_by_kind) or "n/a", width)
+    draw_row(stdscr, y, x, "Graph launches:", _fmt_rate_map(cur.get("graph_by_kind") or {}), width)
     y += 1
-    sampling = cur.get("sampling_by_kind", {})
-    draw_row(stdscr, y, x, "Sampling graphs:", _fmt_rate_map(sampling) or "n/a", width)
+    draw_row(stdscr, y, x, "Sampling graphs:", _fmt_rate_map(cur.get("sampling_by_kind") or {}), width)
     y += 1
-    http_by_api = cur.get("http_by_api", {})
     draw_row(stdscr, y, x, "HTTP:",
-             f"{_fmt_rate_map(http_by_api, order=('chat', 'completions', 'messages', 'responses', 'count_tokens'))}"
-             f"   inflight {int(cur.get('http_inflight_requests', 0))}/{int(cur.get('http_request_capacity', 0))}", width)
+             f"{_fmt_rate_map(cur.get('http_by_api') or {}, order=('chat', 'completions', 'messages', 'responses', 'count_tokens'))}"
+             f"   inflight {_int(cur, 'http_inflight_requests')}/{_int(cur, 'http_request_capacity')}", width)
     y += 1
     draw_row(stdscr, y, x, "Requests:",
-             f"admitted {format_num(cur.get('requests_admitted_total', 0))}"
-             f"   completed {format_num(cur.get('requests_completed_total', 0))}"
-             f"   failed {format_num(cur.get('requests_failed_total', 0))}"
-             f"   cancelled {format_num(cur.get('requests_cancelled_total', 0))}"
-             f"   preemptions {format_num(cur.get('preemptions_total', 0))}", width)
+             f"admitted {_cnt(cur, 'requests_admitted_total')}"
+             f"   completed {_cnt(cur, 'requests_completed_total')}"
+             f"   failed {_cnt(cur, 'requests_failed_total')}"
+             f"   cancelled {_cnt(cur, 'requests_cancelled_total')}"
+             f"   preemptions {_cnt(cur, 'preemptions_total')}", width)
     y += 1
     draw_row(stdscr, y, x, "Host side:",
-             f"frontend workers {int(cur.get('frontend_active_workers', 0))}/{int(cur.get('frontend_worker_capacity', 0))}"
-             f"   grammar frames {format_num(cur.get('constrained_max_inflight', 0))}"
-             f"   reasoning cuts {format_num(cur.get('reasoning_budget_cuts_total', 0))}", width)
+             f"frontend workers {_int(cur, 'frontend_active_workers')}/{_int(cur, 'frontend_worker_capacity')}"
+             f"   grammar frames {_cnt(cur, 'constrained_max_inflight')}"
+             f"   reasoning cuts {_cnt(cur, 'reasoning_budget_cuts_total')}", width)
     y += 1
     draw_box_end(stdscr, y, x, width)
     y += 1
@@ -637,23 +723,28 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     y += 1
     draw_row(stdscr, y, x, "Model:",
              f"{model_name or 'unknown'}   root {model_root or 'n/a'}"
-             f"   ctx {format_num(ctx_len or 0)}", width)
+             f"   ctx {_num_txt(ctx_len)}", width)
     y += 1
     modalities = "/".join(meta.get("input_modalities") or []) or "n/a"
     outputs = "/".join(meta.get("output_modalities") or []) or "n/a"
     draw_row(stdscr, y, x, "Config:",
-             f"max concurrency {int(meta.get('max_concurrency', 0))}"
-             f"   prefill chunk {format_num(meta.get('prefill_chunk_size', 0))}"
-             f"   vocab {format_num(meta.get('vocab_size', 0))}"
-             f"   top logprobs {int(meta.get('max_top_logprobs', 0))}"
+             f"max concurrency {_int(meta, 'max_concurrency')}"
+             f"   prefill chunk {_cnt(meta, 'prefill_chunk_size')}"
+             f"   vocab {_cnt(meta, 'vocab_size')}"
+             f"   top logprobs {_int(meta, 'max_top_logprobs')}"
              f"   in {modalities} → out {outputs}", width)
     y += 1
     # HELP: bytes of weights one decode step reads for one request, as the core
     # declares; zero means undeclared, not "no weights are read".
-    weights = cur.get("decode_weight_bytes", 0.0)
-    weights_txt = f"{format_bytes(weights)} per step per request" if weights else "n/a (core declares none)"
+    weights = cur.get("decode_weight_bytes")
+    if weights is None:
+        weights_txt = "n/a (not reported)"
+    elif weights:
+        weights_txt = f"{format_bytes(weights)} per step per request"
+    else:
+        weights_txt = "n/a (core declares none)"
     draw_row(stdscr, y, x, "Decode weights:",
-             f"{weights_txt}   ·   image window {format_num(meta.get('image_feature_window_tokens', 0))} tok",
+             f"{weights_txt}   ·   image window {_cnt(meta, 'image_feature_window_tokens')} tok",
              width, value_color=COLOR_VALUE if weights else COLOR_DIM)
     y += 1
     draw_box_end(stdscr, y, x, width)
