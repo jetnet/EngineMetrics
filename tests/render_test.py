@@ -1028,6 +1028,29 @@ if __name__ == "__main__":
         assert "— tok/s" in prefill_row and "avg —" in prefill_row, prefill_row
         print("vanished counters: OK")
 
+        # busy state has three branches, and each must be pinned separately:
+        # any published positive gauge is BUSY even when the others are absent,
+        # a published zero next to absent gauges is unknown (not IDLE), and IDLE
+        # needs every traffic gauge published and zero. Only the all-absent case
+        # was covered before, so a revert to "any published value" slipped past.
+        busy_cases = [
+            ({"flare_active_requests": 2.0}, True, "BUSY"),
+            ({"flare_active_requests": 0.0}, None, "n/a (traffic gauges incomplete)"),
+            ({"flare_active_requests": 0.0, "flare_pending_requests": 0.0,
+              "flare_http_inflight_requests": 0.0}, False, "IDLE"),
+        ]
+        for series, expected, label in busy_cases:
+            hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, s=series: (
+                {"_error": None}, {k: [({}, v)] for k, v in s.items()}, None)
+            sampled = hyperflare.sample("localhost", 8045)
+            assert sampled["busy"] is expected, (series, sampled["busy"])
+            scr = FakeScr()
+            hyperflare.draw(scr, sampled, None, [sampled], time.time() - 60, "localhost", 8045, 2,
+                            "glm-5.3-flash", rate_hist=deque())
+            status = next(l for l in scr.buf if "Status:" in l)
+            assert f"({label})" in status, status
+        print("busy branches: OK")
+
         # absent -> absent -> present -> present: a counter that reappears must
         # not manufacture a spike (the previous endpoint is still unknown), and
         # once both endpoints carry it the rate must be positive, so a frame
