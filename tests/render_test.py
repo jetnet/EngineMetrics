@@ -1028,10 +1028,83 @@ if __name__ == "__main__":
         assert "— tok/s" in prefill_row and "avg —" in prefill_row, prefill_row
         print("vanished counters: OK")
 
+        # absent -> absent -> present -> present: a counter that reappears must
+        # not manufacture a spike (the previous endpoint is still unknown), and
+        # once both endpoints carry it the rate must be positive, so a frame
+        # that always prints an em dash cannot pass
         state = {"start_time": time.time(), "prev": None, "history": deque(maxlen=15),
                  "rate_hist": deque(), "model_name": "glm-5.3-flash"}
         args = SimpleNamespace(host="localhost", port=8045, interval=2)
-        for up, gen in [(100.0, 1000.0), (104.0, 1200.0), (2.0, 5.0)]:   # last = restarted
+        seq = [
+            {"flare_uptime_seconds": 100.0},
+            {"flare_uptime_seconds": 104.0},
+            {"flare_uptime_seconds": 108.0, "flare_generated_tokens_total": 500.0,
+             "flare_prefill_tokens_total": 200.0},
+            {"flare_uptime_seconds": 112.0, "flare_generated_tokens_total": 900.0,
+             "flare_prefill_tokens_total": 350.0},
+        ]
+        rows = []
+        for series in seq:
+            hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, s=series: (
+                {"_error": None}, {k: [({}, v)] for k, v in s.items()}, None)
+            scr = FakeScr()
+            hyperflare.tick(scr, args, state)
+            rows.append(next(l for l in scr.buf if "Decode TG (wall)" in l))
+            time.sleep(0.2)
+        assert "— tok/s" in rows[0] and "— tok/s" in rows[1], rows[:2]
+        assert "— tok/s" in rows[2], rows[2]     # reappeared, previous endpoint unknown
+
+        def parse_speed(row):
+            token = row.split("Decode TG (wall):")[1].split("tok/s")[0].strip()
+            scale = {"K": 1e3, "M": 1e6, "B": 1e9}.get(token[-1], 1)
+            return float(token.rstrip("KMB")) * scale
+
+        rate = parse_speed(rows[3])
+        assert rate > 0, rows[3]                # 400 tokens over the sample gap
+        print("reappeared counter: OK")
+
+        # model metadata arrives as JSON carried by Python's parser, so NaN and
+        # Infinity are reachable: int() raises on NaN, and neither may render as
+        # a number. Every field must degrade to n/a individually.
+        bad_meta = {"max_concurrency": float("nan"), "prefill_chunk_size": float("inf"),
+                    "vocab_size": 154880.0, "max_top_logprobs": None}
+        scr = FakeScr()
+        hyperflare.draw(scr, {"t": 1000.0, "_error": None, "busy": False}, None,
+                        [{"t": 1000.0}], time.time() - 60, "localhost", 8045, 2, "m",
+                        rate_hist=deque(), model_meta=bad_meta)
+        config = next(l for l in scr.buf if "Config:" in l)
+        assert "max concurrency n/a" in config, config
+        assert "prefill chunk n/a" in config, config
+        assert "vocab 154.9K" in config, config
+        assert "nan" not in config.lower() and "inf" not in config.lower(), config
+        print("metadata: OK")
+
+        # a partial first-response object renders per-field gaps, never
+        # "samples 0/0 over 0s complete"
+        scr = FakeScr()
+        hyperflare.draw(scr, {"t": 1000.0, "_error": None, "busy": False,
+                              "first_response": {}}, None, [{"t": 1000.0}],
+                        time.time() - 60, "localhost", 8045, 2, "m", rate_hist=deque())
+        fr_row = next(l for l in scr.buf if "First response" in l)
+        assert "samples n/a/n/a over n/as" in fr_row, fr_row
+        assert "n/a (not reported)" in fr_row, fr_row
+        # an all-gap window keeps its maximum unknown
+        all_gap = deque([(1000.0, None, None), (1002.0, None, None)])
+        scr = FakeScr()
+        hyperflare.draw(scr, {"t": 1002.0, "_error": None, "busy": False}, None,
+                        [{"t": 1000.0}, {"t": 1002.0}], time.time() - 60, "localhost", 8045, 2,
+                        "m", rate_hist=all_gap)
+        assert any("PP 120s [—]" in l for l in scr.buf), scr.buf
+        # a label family only reports the kinds it carries
+        assert hyperflare._fmt_rate_map({"anchor": 2.0},
+                                        order=("anchor", "endpoint", "message")) == "anchor 2", \
+            hyperflare._fmt_rate_map({"anchor": 2.0}, order=("anchor", "endpoint", "message"))
+        print("partial payloads: OK")
+
+        state = {"start_time": time.time(), "prev": None, "history": deque(maxlen=15),
+                 "rate_hist": deque(), "model_name": "glm-5.3-flash"}
+        args = SimpleNamespace(host="localhost", port=8045, interval=2)
+        for idx, (up, gen) in enumerate([(100.0, 1000.0), (104.0, 1200.0), (2.0, 5.0)]):  # last = restarted
             hyperflare.fetch_metrics_labeled = lambda h, p, keep_buckets=False, u=up, g=gen: (
                 {"_error": None},
                 {"flare_uptime_seconds": [({}, u)],
@@ -1043,6 +1116,12 @@ if __name__ == "__main__":
             time.sleep(0.2)
             line = next(l for l in scr.buf if "Decode TG (wall)" in l)
             assert "-" not in line, line      # em dash is fine, an ASCII minus is not
+            if idx == 1:
+                # a growing counter must produce a number, so a frame that always
+                # prints an em dash cannot pass this loop
+                token = line.split("Decode TG (wall):")[1].split("tok/s")[0].strip()
+                scale = {"K": 1e3, "M": 1e6, "B": 1e9}.get(token[-1], 1)
+                assert float(token.rstrip("KMB")) * scale > 0, line
         assert len(state["history"]) == 1, len(state["history"])   # window dropped at restart
         print("restart: OK")
     elif which == "vllm":

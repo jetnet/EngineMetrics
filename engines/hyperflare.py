@@ -128,8 +128,10 @@ def _buckets(series, base):
 
 
 def _pct(num, den):
-    """Percentage of a denominator, None when either side is unknown or the
-    denominator is zero (an absent measurement is not a 0% rate)."""
+    """Percentage of a denominator, None when either side is unknown or not a
+    finite number, or the denominator is zero (an absent measurement is not a
+    0% rate)."""
+    num, den = _finite(num), _finite(den)
     if num is None or not den:
         return None
     return num / den * 100.0
@@ -141,8 +143,10 @@ def _pct_txt(num, den, digits=1):
 
 
 def _share_txt(num, den, digits=1):
-    """Share of a label group that the engine saw at all: an em dash when the
-    denominator is zero, because 0/0 is an absent measurement, not a 0% rate."""
+    """Share of a label group that the engine saw at all: an em dash when either
+    side is unknown or the denominator is zero, because 0/0 is an absent
+    measurement, not a 0% rate."""
+    num, den = _finite(num), _finite(den)
     if num is None or not den:
         return "—"
     return f"{num / den * 100.0:.{digits}f}%"
@@ -154,29 +158,43 @@ def _cnt(cur, key, fmt=format_num):
 
 
 def _num_txt(value, fmt=format_num):
-    """Formatted derived value, or 'n/a' when a required input was missing."""
-    return "n/a" if value is None else fmt(value)
+    """Formatted derived value, or 'n/a' when the input is absent or not a
+    finite number (model metadata arrives as JSON, which can carry NaN)."""
+    v = _finite(value)
+    return "n/a" if v is None else fmt(v)
 
 
 def _int(cur, key):
-    """Whole-number measurement, or 'n/a' when the engine did not publish it."""
-    value = cur.get(key)
-    return "n/a" if value is None else str(int(value))
+    """Whole-number measurement, or 'n/a' when the engine did not publish a
+    usable number. int() raises on NaN, so the value is checked first."""
+    return _num_txt(cur.get(key), lambda v: str(int(v)))
 
 
 def _bytes_txt(cur, key):
-    return _cnt(cur, key, format_bytes)
+    return _num_txt(cur.get(key), format_bytes)
 
 
 def _rate_txt(cur, key):
     """A measured per-second gauge, e.g. '4.2M/s', or 'n/a'."""
-    value = cur.get(key)
+    value = _finite(cur.get(key))
     return "n/a" if value is None else format_bytes(value) + "/s"
 
 
 def _secs_txt(cur, key):
-    value = cur.get(key)
+    value = _finite(cur.get(key))
     return "n/a" if value is None else f"{value / 1e9:.2f}s"
+
+
+def _wall_rate(cur, prev, key):
+    """Tokens per wall second across one poll.
+
+    wall_rate_safe() substitutes 0 for a counter an endpoint did not publish, so
+    calling it directly would report a measured zero rate for two unknown
+    samples, and invent throughput when a counter appears mid-window.
+    """
+    if prev is None or key not in cur or key not in prev:
+        return None
+    return wall_rate_safe(cur, prev, key)
 
 
 def _ms_from_ns(ns):
@@ -255,16 +273,20 @@ def sample(host, port):
         s[short + "_buckets"] = _buckets(series, PREFIX + base)
         s[short + "_count"] = s.get(base + "_count")
 
-    # Slot occupancy: a total derived from three gauges is only known when all
-    # three are published, and busy state is only known when any of the traffic
-    # gauges is.
+    # A total derived from three gauges is only known when all three are
+    # published; traffic is BUSY as soon as a published gauge counts something,
+    # IDLE only when every gauge is published and zero, and unknown otherwise.
     active, free_slots, retiring = (s.get("active_requests"), s.get("free_request_slots"),
                                     s.get("retiring_request_slots"))
     s["upslots"] = (None if None in (active, free_slots, retiring)
                     else active + free_slots + retiring)
     traffic = [s.get("active_requests"), s.get("pending_requests"), s.get("http_inflight_requests")]
-    known_traffic = [v for v in traffic if v is not None]
-    s["busy"] = any(v > 0 for v in known_traffic) if known_traffic else None
+    if any(v > 0 for v in traffic if v is not None):
+        s["busy"] = True
+    elif all(v is not None for v in traffic):
+        s["busy"] = False
+    else:
+        s["busy"] = None
 
     # JSON mirror of the same route. A build without the JSON form answers with
     # the text exposition instead (not a dict), so every field here stays None
@@ -331,18 +353,18 @@ def _fmt_tier_events(events):
 
 
 def _fmt_rate_map(mapping, order=None, fmt=None):
-    """'a 1 · b 2' sorted by value (descending), zero entries kept so a missing
-    kind is visible instead of vanishing. A fixed `order` puts the known kinds
-    first and still appends any kind the engine added later. An absent family
-    renders as 'n/a' — its kinds were never reported, so listing them as zeros
-    would invent four counters."""
+    """'a 1 · b 2' sorted by value (descending), kept to the kinds the engine
+    actually reported — a family entry of 0 is a measurement, an absent entry is
+    not, so inventing it would fabricate a counter. A fixed `order` puts the
+    known kinds first and still appends any kind the engine added later. An
+    absent family renders as 'n/a'."""
     if not mapping:
         return "n/a (not reported)"
     fmt = fmt or (lambda v: format_num(v))
     ranked = [k for k, _ in sorted(mapping.items(), key=lambda kv: (-kv[1], kv[0]))]
-    keys = list(order or [])
+    keys = [k for k in (order or []) if k in mapping]
     keys += [k for k in ranked if k not in keys]
-    return " · ".join(f"{k} {fmt(mapping.get(k, 0.0))}" for k in keys)
+    return " · ".join(f"{k} {fmt(mapping[k])}" for k in keys)
 
 
 def _window_delta(history, key):
@@ -396,8 +418,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
         stdscr.refresh()
         return
     y += 1
-    if cur["busy"] is None:
-        status, scolor = "n/a (no traffic gauge published)", COLOR_DIM
+    if cur.get("busy") is None:
+        status, scolor = "n/a (traffic gauges incomplete)", COLOR_DIM
     elif cur["busy"]:
         status, scolor = "BUSY", COLOR_WARN
     else:
@@ -411,8 +433,8 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
     y += 1
 
     # ---- Live throughput ----
-    pp_live = wall_rate_safe(cur, prev, "prefill_tokens_total")
-    tg_live = wall_rate_safe(cur, prev, "generated_tokens_total")
+    pp_live = _wall_rate(cur, prev, "prefill_tokens_total")
+    tg_live = _wall_rate(cur, prev, "generated_tokens_total")
     pp_avg = _avg_wall(history, "prefill_tokens_total")
     tg_avg = _avg_wall(history, "generated_tokens_total")
     if rate_hist is not None:
@@ -448,22 +470,24 @@ def draw(stdscr, cur, prev, history, start_time, host, port, interval, model_nam
         draw_row(stdscr, y, x, "First response:", "n/a (JSON mirror of /metrics unavailable)",
                  width, value_color=COLOR_DIM)
     else:
+        # Every field is rendered on its own: an empty or partial object (a
+        # build that publishes the key without samples) is a set of gaps, not
+        # "samples 0/0 over 0s".
         median = _finite(fr.get("median_seconds"))
-        samples = _finite(fr.get("samples")) or 0.0
-        capacity = _finite(fr.get("capacity")) or 0.0
-        window_s = _finite(fr.get("window_seconds")) or 0.0
-        truncated = "truncated" if fr.get("truncated") else "complete"
-        median_txt = "n/a" if median is None else format_latency(median)
+        truncated = fr.get("truncated")
+        state_txt = "n/a (not reported)" if truncated is None else ("truncated" if truncated else "complete")
         draw_row(stdscr, y, x, "First response:",
-                 f"median {median_txt}   samples {format_num(samples)}/{format_num(capacity)}"
-                 f" over {format_num(window_s)}s   {truncated}", width,
+                 f"median {_num_txt(median, format_latency)}"
+                 f"   samples {_num_txt(fr.get('samples'))}/{_num_txt(fr.get('capacity'))}"
+                 f" over {_num_txt(fr.get('window_seconds'))}s   {state_txt}", width,
                  value_color=COLOR_VALUE if median is not None else COLOR_DIM)
     y += 1
     if rate_hist is not None and len(rate_hist) >= 2:
         pp_pts = [r[1] for r in rate_hist]
         tg_pts = [r[2] for r in rate_hist]
-        pp_max = max((v for v in pp_pts if v is not None), default=0.0)
-        tg_max = max((v for v in tg_pts if v is not None), default=0.0)
+        # None maxima (an all-gap window) must stay a gap, not become 0.0
+        pp_max = max((v for v in pp_pts if v is not None), default=None)
+        tg_max = max((v for v in tg_pts if v is not None), default=None)
         pp_label = f"PP 120s [{format_speed(pp_max)}]:"
         tg_label = f"TG 120s [{format_speed(tg_max)}]:"
         draw_row(stdscr, y, x, pp_label, f"[{sparkline_fit(pp_pts, width - len(pp_label) - 5)}]", width)
