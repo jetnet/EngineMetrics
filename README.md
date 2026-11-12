@@ -1,8 +1,8 @@
 # EngineMetrics
 
 A zero-dependency curses TUI that shows **real-time inference-engine
-metrics** for **vLLM**, **TensorFold**, **mlx-serve**, **oMLX** and **Splash**
-servers.
+metrics** for **vLLM**, **TensorFold**, **mlx-serve**, **oMLX**, **Splash** and
+**HyperFlare** servers.
 Like `htop` for your LLM engine.
 
 ```
@@ -56,6 +56,7 @@ engines/
   mlx_serve.py         mlx-serve backend
   omlx.py              oMLX backend
   splash.py            Splash backend (Apple silicon, /status JSON)
+  hyperflare.py        HyperFlare backend (flare_* /metrics + ?format=json mirror)
 tests/render_test.py   headless single-frame render harness
 ```
 
@@ -69,7 +70,7 @@ in-flight telemetry. **Splash** (incoai/splash, the Apple-silicon Metal/ANE engi
 ships a Prometheus `/metrics` endpoint, but its JSON `/status` endpoint carries the
 same counters plus richer gauges (scheduler states, KV page pool, memory governor,
 thermal state), so the dashboard reads `/status` and delta-samples the cumulative
-counters. This dashboard works with **all five**, auto-detected, so you
+counters. This dashboard works with **all six**, auto-detected, so you
 keep one monitoring tool across engines. Where engines only expose cumulative
 counters, it delta-samples between polls to derive live rates — no agent, no
 exporter, no dependencies.
@@ -83,8 +84,9 @@ exporter, no dependencies.
 | **mlx-serve** | `mlx_serve:*` keys in `/metrics` (checked before `vllm:*` — mlx-serve emits both) | Live TG (wall-clock, from the `*_live` gauge that includes in-flight slots) and PP (from the prefill counter), in-flight prefill progress bar, GPU util + memory footprint, model card (alias/id, arch/quant/ctx/MTP/resident), 120s sparklines, prefix-cache hit rates, TTFT/latency/E2E p50/p90/p99 from the histogram buckets (`~` = interpolated, `>` = tail beyond the last finite bucket), prompt/output token size distributions, failed/rejected counters with engine-restart detection, ANE layers/int8 bytes row, `/props` panel (memory, batching, MTP/PLD, engine settings) |
 | **oMLX** | `engine_pool` in `/health` (fallback: `models_discovered` in `/api/status`) | Live TG from per-slot `tokens_per_second` (in-flight), native prefill progress bar with ETA (`processed`/`total`/`speed`), loaded-model cards (engine_type/ctx/size), memory pool + pressure levels, cache efficiency, engine cumulative TPS averages, device info (chip/GPU cores), custom-kernel availability |
 | **Splash** | `splash_*` keys in `/metrics` (dashboard reads the JSON `/status` mirror) | Live PP/TG (engine-time + wall-clock, delta-sampled), 120s sparklines, scheduler streams + decode batch-width mix (b1–b4), admission queue, KV page-pool occupancy + extent stats, prompt-cache hit rate + state store, memory governor + thermal state, TTFT/ITL p50/p95, DFlash2 draft acceptance, last-batch detail, device card (chip/GPU cores/ANE split) |
+| **HyperFlare** | `flare_*` keys in `/metrics` | Live PP/TG (wall-clock, delta-sampled), engine's own 60s TG gauge, 120s sparklines, request slots + HTTP admission, KV page pool with checkpoint retention split, snapshot pool, GPU and host prefix-cache hit rates, host store tiers (DRAM/NVMe), copy-out/copy-in bytes, host lookup histograms (missing tokens, estimated prefill/transfer p50–p99), speculative decode acceptance + planned verification depth (window deltas), drafts by source and depth, scheduler executions by reason with per-execution time, CUDA graph launches by kind, HTTP requests by API, first-response median from the `/metrics?format=json` mirror, model card from `/v1/models` |
 
-Auto-detection can be overridden with `--engine {vllm,tensorfold,mlx-serve,omlx,splash}`.
+Auto-detection can be overridden with `--engine {vllm,tensorfold,mlx-serve,omlx,splash,hyperflare}`.
 
 ## Install & run
 
@@ -101,7 +103,7 @@ python3 engine_metrics.py --port 8001                           # Splash (defaul
 |---|---|---|
 | `--host` | `localhost` | Engine host |
 | `--port` | `8100` | Engine port |
-| `--engine` | `auto` | Force backend (`vllm` / `tensorfold` / `mlx-serve` / `omlx` / `splash`) instead of auto-detect |
+| `--engine` | `auto` | Force backend (`vllm` / `tensorfold` / `mlx-serve` / `omlx` / `splash` / `hyperflare`) instead of auto-detect |
 | `--interval` | `2` | Refresh seconds |
 | `--window` | `15` | Rate-averaging window (samples) |
 | `--spill-cap` | — | TensorFold spill-tier capacity in GiB; fallback for the `Spill fill` bar when `/health` has no `spill.gib` (the engine's configured `SPILL_GIB` is preferred) |
@@ -305,6 +307,45 @@ delta-sampled between polls:
 - **Honest gaps**: `—` when a window has no counter progress (idle engine),
   same convention as the other backends.
 
+## How the HyperFlare numbers are derived
+
+HyperFlare (NVIDIA/hyperflare-inference) publishes Prometheus text at `/metrics`;
+its `/health` is just `{"status": "ok"}`. One scrape per poll plus a one-off
+`/v1/models` read fills every panel. Its counters are **cumulative**, so live
+rates are delta-sampled between polls, and an engine restart (uptime going
+backwards) drops the window instead of reporting a negative rate:
+
+- **PP (wall)** = Δ`flare_prefill_tokens_total` / Δwall — prompt tokens consumed
+  by completed prefill, excluding padding and prefix reuse.
+- **TG (wall)** = Δ`flare_generated_tokens_total` / Δwall — committed generated
+  tokens; both counters move when work completes, so the rate steps.
+- **TG (engine 60s)** = `flare_generated_tokens_last_minute` ÷ 60 — the engine's
+  own minute window, refreshed every five seconds.
+- **KV pool** = `flare_total_kv_pages` − `flare_free_kv_pages` −
+  `flare_cached_kv_pages`: the total counts the pool *before* checkpoint
+  retention, and checkpoint pages are neither free nor request-owned.
+- **Prefix cache** = hits ÷ lookups for `flare_cache_*_total` (GPU checkpoints)
+  and `flare_host_cache_*_total` (host store); reused tokens, copy bytes and the
+  measured copy rates come from the same families. `store_skipped_total` counts
+  duplicates and retries, not dropped records.
+- **Acceptance and DEPTH** = window deltas, as the engine's own dashboard defines
+  them: mean acceptance length = 1 + Δ`flare_accepted_draft_tokens_total` ÷
+  Δ`flare_draft_request_rounds_total` (the bonus token is not part of the
+  accepted counter); DEPTH = Δ`flare_verification_draft_tokens_total` ÷
+  Δ`flare_verification_request_rounds_total`.
+- **Host histograms** = the only histograms the engine publishes
+  (`missing_tokens`, `estimated_prefill_ns`, `estimated_transfer_ns`); `~` is
+  interpolated inside a bucket, `>` lies past the last finite bucket.
+- **First response** = `first_response.median_seconds` from the JSON mirror of the
+  same route (`/metrics?format=json`): server-side time from HTTP admission to
+  the first offered answer or reasoning text over a 60 s window. A build without
+  the JSON form leaves the row at `n/a`.
+- **Checkpoint overhead** = `flare_checkpoint_extra_work_nanoseconds_total`,
+  which charges *predicted* extra prefill and copy work — not a GPU timing.
+- **Honest gaps**: `—`/`n/a` when a window has no counter progress or the engine
+  publishes nothing usable (`decode_weight_bytes` is zero when the core declares
+  no per-step weight read).
+
 ## Notes
 
 - Works over plain HTTP to any reachable engine endpoint (LAN or SSH-tunneled).
@@ -314,7 +355,9 @@ delta-sampled between polls:
   (GB10) serving GLM-5.3-Flash NVFP4 with native MTP3, mlx-serve on Apple M5 Max
   serving Qwen3.8-Flash-Next 4-bit with MTP, oMLX (omlx-server v0.7) on Apple
   M5 Max serving Qwen3.6-35B-A3B / Qwen2.5-7B, Splash 1.3.1 on Apple M5 Max
-  serving mlx-community/Qwen3.8-27B-8bit (int8 KV, DFlash2 draft, ANE FFN split).
+  serving mlx-community/Qwen3.8-27B-8bit (int8 KV, DFlash2 draft, ANE FFN split),
+  HyperFlare over an SSH tunnel on localhost:8045 serving glm-5.3-flash
+  (GLM-5.3-Flash-FP4-Local, 1M context).
 
 ## License
 
